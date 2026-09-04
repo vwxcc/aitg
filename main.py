@@ -26,11 +26,14 @@ Optional:
   MAX_CONTEXT_WORDS=10000
   POLL_TIMEOUT=30
   LOG_LEVEL=INFO
+  QUEUE_WORKERS=12
+  FILE_CONCURRENCY=2
+  OCR_CONCURRENCY=1
+  MEDIA_CONCURRENCY=1
 
 Dependencies (recommended):
   aiogram>=3.20,<4
   aiohttp>=3.10
-  aiosqlite>=0.20
   python-dotenv>=1.0
   PyMuPDF>=1.24
   python-docx>=1.1
@@ -584,13 +587,23 @@ class Repo:
                 (key, value, iso_now()),
             )
 
+        # Migrate old installations: before this version `mode` duplicated `role`.
+        # Keep authorization semantics in `role` and synchronize only known user modes.
+        await self.db.execute(
+            "UPDATE users SET role=mode, updated_at=? "
+            "WHERE mode IN ('student','teacher','applicant') AND role='student' AND mode!='student'",
+            (iso_now(),),
+        )
+
         # Seed only the admin IDs from env, never the token/key.
         for tg_id in ADMIN_IDS:
             user = await self.get_user(tg_id)
             if not user:
                 await self.ensure_user_obj(tg_id, None, None, None, None)
                 user = await self.get_user(tg_id)
-            await self.db.execute("UPDATE users SET role='admin', updated_at=? WHERE telegram_id=?", (iso_now(), tg_id))
+            # Authorization is stored separately in `admins`; do not force the
+            # assistant role back to `admin` on every restart. An admin can still
+            # choose student/teacher/applicant behavior for AI responses.
             if user:
                 await self.db.execute(
                     "INSERT OR IGNORE INTO admins(user_id,telegram_id,level,created_at) VALUES(?,?,?,?)",
@@ -648,6 +661,21 @@ class Repo:
         pairs = [(k, v) for k, v in fields.items() if k in allowed]
         if not pairs:
             return
+
+        # `role` is authoritative for assistant behavior. Keep `mode` synchronized
+        # so databases created by older versions remain compatible.
+        field_names = {k for k, _ in pairs}
+        if "role" in field_names:
+            role_value = next(v for k, v in pairs if k == "role")
+            if role_value in MODE_PROMPTS:
+                pairs = [(k, v) for k, v in pairs if k != "mode"]
+                pairs.append(("mode", role_value))
+        elif "mode" in field_names:
+            mode_value = next(v for k, v in pairs if k == "mode")
+            if mode_value in MODE_PROMPTS:
+                pairs = [(k, v) for k, v in pairs if k != "role"]
+                pairs.append(("role", mode_value))
+
         sets = ", ".join(f"{k}=?" for k, _ in pairs) + ", updated_at=?"
         values = [v for _, v in pairs] + [iso_now(), telegram_id]
         await self.db.execute(f"UPDATE users SET {sets} WHERE telegram_id=?", tuple(values))
@@ -694,6 +722,17 @@ class Repo:
         )
         await self.db.execute("UPDATE chats SET updated_at=? WHERE id=?", (iso_now(), chat_id))
         return int(cur.lastrowid)
+
+    async def update_message(
+        self,
+        message_id: int,
+        content: str,
+        model_key: Optional[str] = None,
+    ) -> None:
+        await self.db.execute(
+            "UPDATE messages SET content=?, model_key=? WHERE id=?",
+            (content, model_key, message_id),
+        )
 
     async def recent_messages(self, chat_id: int, limit: int = 100) -> list[sqlite3.Row]:
         rows = await self.db.fetchall(
@@ -990,7 +1029,7 @@ class Repo:
         return int(cur.lastrowid)
 
     async def update_file(self, file_id: int, **fields: Any) -> None:
-        allowed = {"processing_status", "extracted_text", "ocr_result", "transcription", "metadata_json"}
+        allowed = {"processing_status", "extracted_text", "ocr_result", "transcription", "metadata_json", "message_id"}
         pairs = [(k, v) for k, v in fields.items() if k in allowed]
         if not pairs:
             return
@@ -1047,8 +1086,12 @@ MODE_PROMPTS = {
 
 
 def build_system_prompt(user: sqlite3.Row, extra_context: str = "") -> str:
-    mode = user["mode"] if user["mode"] in MODE_PROMPTS else "student"
-    return f"{BASE_SYSTEM_PROMPT}\n\nТекущий режим:\n{MODE_PROMPTS[mode]}\n\n{extra_context}".strip()
+    # `role` is the single source of truth for the assistant behavior.
+    # The old `mode` column is kept only for DB backward compatibility.
+    role = str(user["role"] or "student").strip().lower()
+    if role not in MODE_PROMPTS:
+        role = "student"
+    return f"{BASE_SYSTEM_PROMPT}\n\nТекущий режим:\n{MODE_PROMPTS[role]}\n\n{extra_context}".strip()
 
 
 @dataclass
@@ -1416,20 +1459,26 @@ class FileProcessor:
         raise RuntimeError("PPT/ODP требуют внешнюю конвертацию; базовый обработчик поддерживает PPTX")
 
     async def _image(self, path: Path) -> FileResult:
-        # We keep image storage on disk. OCR is optional; the actual image can be passed to a vision-capable provider later.
+        # We keep the original upload on disk. A converted HEIC is temporary only.
         normalized = path
+        temporary_normalized: Optional[Path] = None
         if path.suffix.lower() in {".heic", ".heif"}:
             normalized = await self._convert_heic(path)
+            if normalized != path:
+                temporary_normalized = normalized
         try:
-            from PIL import Image
-            with Image.open(normalized) as img:
-                meta = {"width": img.width, "height": img.height, "format": img.format}
-        except Exception:
-            meta = {}
-        ocr_text = ""
-        async with self.ocr_sem:
-            ocr_text = await self._ocr(normalized)
-        return FileResult(text=ocr_text, kind="image", ocr_text=ocr_text, metadata=meta)
+            try:
+                from PIL import Image
+                with Image.open(normalized) as img:
+                    meta = {"width": img.width, "height": img.height, "format": img.format}
+            except Exception:
+                meta = {}
+            async with self.ocr_sem:
+                ocr_text = await self._ocr(normalized)
+            return FileResult(text=ocr_text, kind="image", ocr_text=ocr_text, metadata=meta)
+        finally:
+            if temporary_normalized:
+                temporary_normalized.unlink(missing_ok=True)
 
     async def _ocr(self, path: Path) -> str:
         try:
@@ -1447,9 +1496,16 @@ class FileProcessor:
             import pillow_heif  # type: ignore
             pillow_heif.register_heif_opener()
             img = await asyncio.to_thread(Image.open, path)
-            await asyncio.to_thread(img.save, out, format="PNG")
+            try:
+                await asyncio.to_thread(img.save, out, format="PNG")
+            finally:
+                try:
+                    img.close()
+                except Exception:
+                    pass
             return out
         except Exception as exc:
+            out.unlink(missing_ok=True)
             log.warning("HEIC conversion failed: %s", type(exc).__name__)
             return path
 
@@ -1547,6 +1603,7 @@ class PriorityQueueManager:
     async def _worker_loop(self):
         while self.running:
             item = await self.queue.get()
+            task_done = False
             try:
                 await self.repo.update_job(item.job_id, STATUS_RUNNING)
                 if item.kind == "ai":
@@ -1559,13 +1616,22 @@ class PriorityQueueManager:
                     raise RuntimeError(f"Unknown queue kind: {item.kind}")
                 await self.repo.update_job(item.job_id, STATUS_COMPLETED)
             except asyncio.CancelledError:
-                await self.repo.update_job(item.job_id, STATUS_INTERRUPTED)
+                try:
+                    await self.repo.update_job(item.job_id, STATUS_INTERRUPTED)
+                finally:
+                    self.queue.task_done()
+                    task_done = True
                 raise
             except Exception as exc:
                 log.exception("Queue job %s failed", item.job_id)
-                await self.repo.update_job(item.job_id, STATUS_FAILED, error=f"{type(exc).__name__}: {exc}")
+                await self.repo.update_job(
+                    item.job_id,
+                    STATUS_FAILED,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
             finally:
-                self.queue.task_done()
+                if not task_done:
+                    self.queue.task_done()
 
 
 # -----------------------------------------------------------------------------
@@ -1672,7 +1738,7 @@ class App:
             builder.button(text="🆘 Поддержка", url=f"https://t.me/{SUPPORT_USERNAME.lstrip('@')}")
         return builder.as_markup()
 
-    def main_keyboard(self, user: sqlite3.Row) -> InlineKeyboardMarkup:
+    async def main_keyboard(self, user: sqlite3.Row) -> InlineKeyboardMarkup:
         builder = InlineKeyboardBuilder()
         builder.button(text="🤖 ИИ", callback_data="menu_ai")
         builder.button(text="📚 Режимы", callback_data="menu_modes")
@@ -1681,7 +1747,7 @@ class App:
         builder.button(text="👤 Профиль", callback_data="menu_profile")
         builder.button(text="⚙️ Настройки", callback_data="menu_settings")
         builder.button(text="🆘 Поддержка", callback_data="menu_support")
-        if user["role"] == "admin":
+        if await self.repo.is_admin(int(user["telegram_id"])):
             builder.button(text="👑 Админ-панель", callback_data="admin_home")
         builder.adjust(2, 2, 2, 1, 1)
         return builder.as_markup()
@@ -1740,7 +1806,7 @@ class App:
             f"Привет, {name}! 👋\n\n"
             "Я AI-помощник для учёбы, документов, поступления и обычных вопросов.\n\n"
             "Просто отправь сообщение или файл.",
-            reply_markup=self.main_keyboard(user),
+            reply_markup=await self.main_keyboard(user),
         )
 
     async def handle_commands(self, message: Message):
@@ -1808,7 +1874,7 @@ class App:
                 return
             if mode == "admin" and not await self.repo.is_admin(callback.from_user.id):
                 return
-            await self.repo.update_user(callback.from_user.id, mode=mode)
+            await self.repo.update_user(callback.from_user.id, role=mode)
             await self.bot.send_message(callback.message.chat.id, f"✅ Режим: {mode}")
             return
 
@@ -1837,7 +1903,7 @@ class App:
         b = InlineKeyboardBuilder()
         for mode, title in [("student", "🎓 Ученик"), ("teacher", "👩‍🏫 Учитель"), ("applicant", "🎯 Поступающий")]:
             b.button(text=title, callback_data=f"mode:{mode}")
-        if user["role"] == "admin":
+        if await self.repo.is_admin(int(user["telegram_id"])):
             b.button(text="🛠 Администратор", callback_data="mode:admin")
         b.adjust(1)
         await self.bot.send_message(chat_id, "📚 Выберите режим:", reply_markup=b.as_markup())
@@ -2033,8 +2099,8 @@ class App:
     # ------------------------------------------------------------------
 
     async def run_ai_job(self, job_id: str, payload: dict[str, Any]):
-        user_id = None
-        chat_id = None
+        user_id: Optional[int] = None
+        chat_id: Optional[int] = None
         try:
             job = await self.db.fetchone("SELECT * FROM jobs WHERE id=?", (job_id,))
             if not job:
@@ -2052,25 +2118,56 @@ class App:
             allowed, reset_at, _ = await self.can_use_model(user, model)
             if not allowed:
                 reset_txt = human_duration(int((reset_at - utc_now()).total_seconds())) if reset_at else "позже"
-                await self.bot.send_message(payload["telegram_chat_id"], f"⏳ Лимит этой модели временно исчерпан. Лимит обновится через {reset_txt}.")
+                await self.bot.send_message(
+                    payload["telegram_chat_id"],
+                    f"⏳ Лимит этой модели временно исчерпан. Лимит обновится через {reset_txt}.",
+                )
                 return
 
             await self.bot.send_message(payload["telegram_chat_id"], TEXT_AI)
-            await self.repo.record_event("processing_started", user_id, chat_id, {})
+            await self.repo.record_event(
+                "processing_started",
+                user_id,
+                chat_id,
+                {"source": payload.get("source", "text")},
+            )
 
-            messages = await self.build_context_messages(user, chat, extra_context=payload.get("extra_context", ""))
+            messages = await self.build_context_messages(
+                user, chat, extra_context=payload.get("extra_context", "")
+            )
             result = await self.ai.request(model, messages, user)
 
-            # Handle only the two explicitly allowed tools.
+            # Only two internal tool protocols are accepted.
             tool = parse_tool_call(result.text)
             if tool and tool.name == SAFE_TOOL_SCHOOL_DB:
                 await self.bot.send_message(payload["telegram_chat_id"], TEXT_DB)
-                await self.repo.record_event("db_search_started", user_id, chat_id, {"tags": tool.arguments.get("tags", [])})
-                knowledge = await self.repo.find_knowledge(tool.arguments.get("query", ""), normalize_tags(tool.arguments.get("tags", [])))
+                await self.repo.record_event(
+                    "db_search_started",
+                    user_id,
+                    chat_id,
+                    {"tags": tool.arguments.get("tags", [])},
+                )
+                knowledge = await self.repo.find_knowledge(
+                    tool.arguments.get("query", ""),
+                    normalize_tags(tool.arguments.get("tags", [])),
+                )
                 db_context = self.format_knowledge(knowledge)
-                await self.repo.record_event("db_search_finished", user_id, chat_id, {"results": len(knowledge)})
-                messages2 = await self.build_context_messages(user, chat, extra_context=(payload.get("extra_context", "") + "\n\nSCHOOL_DB RESULT:\n" + db_context).strip())
-                messages2.append({"role": "user", "content": payload["text"]})
+                await self.repo.record_event(
+                    "db_search_finished",
+                    user_id,
+                    chat_id,
+                    {"results": len(knowledge)},
+                )
+                messages2 = await self.build_context_messages(
+                    user,
+                    chat,
+                    extra_context=(
+                        payload.get("extra_context", "")
+                        + "\n\nSCHOOL_DB RESULT:\n"
+                        + db_context
+                    ).strip(),
+                )
+                messages2.append({"role": ROLE_USER, "content": payload["text"]})
                 result2 = await self.ai.request(model, messages2, user)
                 result = AIResult(
                     text=result2.text,
@@ -2086,10 +2183,17 @@ class App:
                     chat_id,
                     payload.get("message_id"),
                     question,
-                    {"extra_context": payload.get("extra_context", ""), "original_text": payload["text"]},
+                    {
+                        "extra_context": payload.get("extra_context", ""),
+                        "original_text": payload["text"],
+                    },
                 )
                 await self.bot.send_message(payload["telegram_chat_id"], f"❓ {question}")
-                usage_state = await self.repo.get_usage(user_id, model["model_key"], int(model["reset_period_seconds"] or DEFAULT_RESET_PERIOD))
+                usage_state = await self.repo.get_usage(
+                    user_id,
+                    model["model_key"],
+                    int(model["reset_period_seconds"] or DEFAULT_RESET_PERIOD),
+                )
                 await self.repo.add_usage(
                     user_id,
                     model["model_key"],
@@ -2100,26 +2204,76 @@ class App:
                     usage_state["window_reset"],
                     result.request_id,
                 )
+                await self.repo.record_event("waiting_for_user", user_id, chat_id, {})
                 return
 
-            # Store usage + assistant message.
-            usage_state = await self.repo.get_usage(user_id, model["model_key"], int(model["reset_period_seconds"] or DEFAULT_RESET_PERIOD))
-            await self.repo.add_usage(user_id, model["model_key"], chat_id, result.input_tokens, result.output_tokens, usage_state["window_start"], usage_state["window_reset"], result.request_id)
-            await self.repo.save_message(chat_id, ROLE_ASSISTANT, result.text, model["model_key"], result.input_tokens, result.output_tokens)
+            usage_state = await self.repo.get_usage(
+                user_id,
+                model["model_key"],
+                int(model["reset_period_seconds"] or DEFAULT_RESET_PERIOD),
+            )
+            await self.repo.add_usage(
+                user_id,
+                model["model_key"],
+                chat_id,
+                result.input_tokens,
+                result.output_tokens,
+                usage_state["window_start"],
+                usage_state["window_reset"],
+                result.request_id,
+            )
+            await self.repo.save_message(
+                chat_id,
+                ROLE_ASSISTANT,
+                result.text,
+                model["model_key"],
+                result.input_tokens,
+                result.output_tokens,
+            )
             await self.maybe_summarize(chat_id, user, model)
-            await self.repo.record_event("generation_finished", user_id, chat_id, {"request_id": result.request_id})
-            await self.send_long(payload["telegram_chat_id"], result.text or "Не удалось получить текст ответа.")
-            await self.repo.record_event("completed", user_id, chat_id, {})
+            await self.repo.record_event(
+                "generation_finished",
+                user_id,
+                chat_id,
+                {"request_id": result.request_id},
+            )
+            await self.send_long(
+                payload["telegram_chat_id"],
+                result.text or "Не удалось получить текст ответа.",
+            )
+            await self.repo.record_event(
+                "completed",
+                user_id,
+                chat_id,
+                {"source": payload.get("source", "text")},
+            )
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             log.exception("AI job failed")
             if payload.get("telegram_chat_id"):
-                msg = "❌ Ошибка API." if "HTTP" in str(exc) or isinstance(exc, aiohttp.ClientError) else "❌ Ошибка генерации.\nПопробуйте ещё раз."
+                msg = (
+                    "❌ Ошибка API."
+                    if "HTTP" in str(exc) or isinstance(exc, aiohttp.ClientError)
+                    else "❌ Ошибка генерации.\nПопробуйте ещё раз."
+                )
                 try:
                     await self.bot.send_message(payload["telegram_chat_id"], msg)
                 except Exception:
                     pass
             if user_id:
-                await self.repo.record_event("generation_error", user_id, chat_id, {"error": type(exc).__name__})
+                try:
+                    await self.repo.record_event(
+                        "generation_error",
+                        user_id,
+                        chat_id,
+                        {"error": type(exc).__name__},
+                    )
+                except Exception:
+                    pass
+            # IMPORTANT: propagate the exception so PriorityQueueManager marks
+            # the persisted job as FAILED instead of incorrectly COMPLETED.
+            raise
 
     async def build_context_messages(self, user: sqlite3.Row, chat: sqlite3.Row, extra_context: str = "") -> list[dict[str, str]]:
         max_words = int(await self.repo.get_setting("max_context_words", str(MAX_CONTEXT_WORDS)) or MAX_CONTEXT_WORDS)
@@ -2208,70 +2362,96 @@ class App:
         chat = await self.db.fetchone("SELECT * FROM chats WHERE id=?", (chat_id,))
         if not user or not chat:
             raise RuntimeError("User or chat not found")
+
         tg_chat_id = payload["telegram_chat_id"]
         try:
             kind = payload.get("kind")
             if kind == "photo":
                 await self.bot.send_message(tg_chat_id, TEXT_OCR)
-            elif kind in {"document"}:
+            elif kind == "document":
                 await self.bot.send_message(tg_chat_id, TEXT_FILE)
             elif kind in {"audio", "video"}:
                 await self.bot.send_message(tg_chat_id, "👀 Обрабатываю медиа…")
+
+            # Stage 1: CPU/IO-heavy file work only. No AI call is made here.
             result = await self.files.process(file_row)
             context = result.text.strip()
             if result.kind in {"image", "table"}:
-                await self.bot.send_message(tg_chat_id, TEXT_TABLE if result.kind == "table" else TEXT_OCR)
+                await self.bot.send_message(
+                    tg_chat_id,
+                    TEXT_TABLE if result.kind == "table" else TEXT_OCR,
+                )
+
             caption = (payload.get("caption") or "").strip()
             if not caption:
                 caption = "Проанализируй этот файл и объясни содержимое по существу."
+
             details = (
                 f"[FILE: {file_row['original_name']}]\n"
                 f"Тип: {result.kind}\n"
                 f"Извлечённые данные:\n{truncate_text(context, 50_000)}"
             )
+            history_content = f"{caption}\n\n{details}"
+
             model = await self.selected_model(user)
             if not model:
-                raise RuntimeError("No model")
-            allowed, reset_at, _ = await self.can_use_model(user, model)
-            if not allowed:
-                reset_txt = human_duration(int((reset_at - utc_now()).total_seconds())) if reset_at else "позже"
-                await self.bot.send_message(tg_chat_id, f"⏳ Лимит этой модели временно исчерпан. Лимит обновится через {reset_txt}.")
-                return
+                raise RuntimeError("No enabled model")
 
-            # Save a user-visible text representation of the file request for long-term history.
-            await self.repo.save_message(chat_id, ROLE_USER, f"{caption}\n\n{details}", model["model_key"])
-            await self.bot.send_message(tg_chat_id, TEXT_AI)
-            messages = await self.build_context_messages(user, chat, extra_context=details)
-            result_ai = await self.ai.request(model, messages + [{"role": "user", "content": caption}], user)
-            tool = parse_tool_call(result_ai.text)
-            if tool and tool.name == SAFE_TOOL_SCHOOL_DB:
-                await self.bot.send_message(tg_chat_id, TEXT_DB)
-                knowledge = await self.repo.find_knowledge(tool.arguments.get("query", ""), normalize_tags(tool.arguments.get("tags", [])))
-                db_context = self.format_knowledge(knowledge)
-                messages2 = await self.build_context_messages(user, chat, extra_context=details + "\n\nSCHOOL_DB RESULT:\n" + db_context)
-                result_ai2 = await self.ai.request(model, messages2 + [{"role": "user", "content": caption}], user)
-                result_ai = AIResult(
-                    text=result_ai2.text,
-                    input_tokens=result_ai.input_tokens + result_ai2.input_tokens,
-                    output_tokens=result_ai.output_tokens + result_ai2.output_tokens,
-                    request_id=result_ai2.request_id,
-                    raw=result_ai2.raw,
+            # Replace the placeholder created during Telegram file intake.
+            # This prevents one upload from creating two user messages in history.
+            if file_row["message_id"]:
+                await self.repo.update_message(
+                    int(file_row["message_id"]),
+                    history_content,
+                    model["model_key"],
                 )
-            elif tool and tool.name == SAFE_TOOL_ASK_USER:
-                await self.repo.upsert_pending_question(user["id"], chat_id, None, tool.arguments["question"], {"extra_context": details})
-                await self.bot.send_message(tg_chat_id, f"❓ {tool.arguments['question']}")
-                return
+            else:
+                message_id = await self.repo.save_message(
+                    chat_id, ROLE_USER, history_content, model["model_key"]
+                )
+                await self.repo.update_file(file_id, message_id=message_id)
 
-            await self.repo.save_message(chat_id, ROLE_ASSISTANT, result_ai.text, model["model_key"], result_ai.input_tokens, result_ai.output_tokens)
-            usage_state = await self.repo.get_usage(user["id"], model["model_key"], int(model["reset_period_seconds"] or DEFAULT_RESET_PERIOD))
-            await self.repo.add_usage(user["id"], model["model_key"], chat_id, result_ai.input_tokens, result_ai.output_tokens, usage_state["window_start"], usage_state["window_reset"], result_ai.request_id)
-            await self.maybe_summarize(chat_id, user, model)
-            await self.send_long(tg_chat_id, result_ai.text)
-            await self.repo.record_event("completed", user["id"], chat_id, {"file_id": file_id})
+            # Stage 2: AI is a separate persisted job with higher priority than
+            # new file-processing jobs, so all AI requests share one controlled path.
+            ai_payload = {
+                "telegram_chat_id": tg_chat_id,
+                "message_id": payload.get("message_id"),
+                "content_message_id": file_row["message_id"],
+                "text": caption,
+                "extra_context": details,
+                "source": "file",
+                "file_id": file_id,
+            }
+            ai_job_id = await self.repo.create_job(
+                "ai",
+                int(user["id"]),
+                chat_id,
+                ai_payload,
+                priority=20,
+            )
+            await self.queue.enqueue(ai_job_id, "ai", ai_payload, 20)
+            await self.repo.record_event(
+                "file_ai_enqueued",
+                int(user["id"]),
+                chat_id,
+                {"file_id": file_id, "ai_job_id": ai_job_id},
+            )
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             log.exception("File job failed")
-            await self.bot.send_message(tg_chat_id, "❌ Не удалось обработать файл.")
-            await self.repo.record_event("file_error", user["id"], chat_id, {"file_id": file_id, "error": type(exc).__name__})
+            try:
+                await self.bot.send_message(tg_chat_id, "❌ Не удалось обработать файл.")
+            except Exception:
+                pass
+            await self.repo.record_event(
+                "file_error",
+                int(user["id"]),
+                chat_id,
+                {"file_id": file_id, "error": type(exc).__name__},
+            )
+            # IMPORTANT: propagate so the persisted file job becomes FAILED.
+            raise
 
     # ------------------------------------------------------------------
     # Admin panel
