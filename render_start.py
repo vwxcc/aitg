@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import time
 
 from aiohttp import web
 from aiogram.types import Update
@@ -13,16 +14,40 @@ from aiogram.types import Update
 import main as bot_main
 
 
+# ============================================================
+# CONFIG
+# ============================================================
+
 HOST = "0.0.0.0"
 PORT = int(os.getenv("PORT", "10000"))
 
+# Максимальный размер HTTP-запроса.
+# Telegram webhook обычно намного меньше.
+MAX_HTTP_BODY = 50 * 1024 * 1024
+
+# Простая защита health endpoint.
+# Не влияет на Telegram webhook.
+HEALTH_MIN_INTERVAL = 2.0
+
+# Максимальное количество одновременно обрабатываемых
+# webhook-запросов.
+MAX_WEBHOOK_CONCURRENCY = 20
+
+
+# ============================================================
+# ADMIN IDS
+# ============================================================
 
 def parse_admin_ids() -> set[int]:
     raw = os.getenv("ADMIN_TELEGRAM_IDS", "")
+
     result: set[int] = set()
 
     for value in raw.replace(";", ",").replace("\n", ",").split(","):
         value = value.strip()
+
+        if not value:
+            continue
 
         if value.startswith("+"):
             value = value[1:].strip()
@@ -37,7 +62,12 @@ bot_main.ADMIN_IDS.clear()
 bot_main.ADMIN_IDS.update(parse_admin_ids())
 
 
+# ============================================================
+# APP STARTUP
+# ============================================================
+
 async def prepare_app(app: bot_main.App) -> None:
+
     if not bot_main.BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN не задан")
 
@@ -60,23 +90,40 @@ async def prepare_app(app: bot_main.App) -> None:
     )
 
 
+# ============================================================
+# CLEANUP
+# ============================================================
+
 async def cleanup_app(app: bot_main.App) -> None:
+
     try:
         await app.queue.stop()
+
     finally:
+
         try:
             await app.ai.close()
+
         finally:
+
             await app.bot.session.close()
 
+
+# ============================================================
+# HTTP SERVER
+# ============================================================
 
 async def create_http_app(
     app: bot_main.App,
 ) -> web.Application:
 
     http_app = web.Application(
-        client_max_size=50 * 1024 * 1024
+        client_max_size=MAX_HTTP_BODY,
     )
+
+    # --------------------------------------------------------
+    # WEBHOOK SECRET
+    # --------------------------------------------------------
 
     secret = os.getenv(
         "WEBHOOK_SECRET",
@@ -87,6 +134,10 @@ async def create_http_app(
         secret = hashlib.sha256(
             bot_main.BOT_TOKEN.encode("utf-8")
         ).hexdigest()[:48]
+
+    # --------------------------------------------------------
+    # WEBHOOK URL
+    # --------------------------------------------------------
 
     external_url = os.getenv(
         "RENDER_EXTERNAL_URL",
@@ -99,6 +150,7 @@ async def create_http_app(
     ).strip().rstrip("/")
 
     if not webhook_url:
+
         if not external_url:
             raise RuntimeError(
                 "RENDER_EXTERNAL_URL не найден"
@@ -108,30 +160,75 @@ async def create_http_app(
             f"{external_url}/telegram/webhook/{secret}"
         )
 
+    # --------------------------------------------------------
+    # WEBHOOK CONCURRENCY
+    # --------------------------------------------------------
+
+    webhook_semaphore = asyncio.Semaphore(
+        MAX_WEBHOOK_CONCURRENCY
+    )
+
+    # --------------------------------------------------------
+    # HEALTH RATE LIMIT
+    # --------------------------------------------------------
+
+    last_health_request = 0.0
+
+    health_lock = asyncio.Lock()
+
+    # --------------------------------------------------------
+    # HEALTH
+    # --------------------------------------------------------
+
     async def health(
         request: web.Request,
     ) -> web.Response:
 
-        return web.json_response({
-            "ok": True,
-            "service": "aitg",
-            "model": bot_main.AI_MODEL_NAME,
-            "model_id": bot_main.AI_MODEL_ID,
-            "admins_configured": len(
-                bot_main.ADMIN_IDS
-            ),
-        })
+        nonlocal last_health_request
+
+        now = time.monotonic()
+
+        async with health_lock:
+
+            if (
+                now - last_health_request
+                < HEALTH_MIN_INTERVAL
+            ):
+                return web.Response(
+                    status=429,
+                    text="Too Many Requests",
+                )
+
+            last_health_request = now
+
+        # Никаких запросов к AI,
+        # файлам, очереди или хранилищу.
+        return web.json_response(
+            {
+                "ok": True,
+                "service": "aitg",
+            }
+        )
+
+    # --------------------------------------------------------
+    # WEBHOOK
+    # --------------------------------------------------------
 
     async def webhook(
         request: web.Request,
     ) -> web.Response:
 
-        if request.match_info.get("secret") != secret:
+        # Проверяем URL secret
+        if (
+            request.match_info.get("secret")
+            != secret
+        ):
             return web.Response(
                 status=404,
                 text="Not found",
             )
 
+        # Проверяем Telegram secret header
         header_secret = request.headers.get(
             "X-Telegram-Bot-Api-Secret-Token",
             "",
@@ -143,29 +240,45 @@ async def create_http_app(
                 text="Forbidden",
             )
 
-        try:
-            data = await request.json()
+        # Ограничиваем одновременно обрабатываемые
+        # HTTP webhook-запросы.
+        async with webhook_semaphore:
 
-            update = Update.model_validate(data)
+            try:
 
-            await app.dp.feed_update(
-                app.bot,
-                update,
-            )
+                data = await request.json()
 
-            return web.json_response(
-                {"ok": True}
-            )
+                update = Update.model_validate(
+                    data
+                )
 
-        except Exception:
-            bot_main.log.exception(
-                "Webhook update failed"
-            )
+                await app.dp.feed_update(
+                    app.bot,
+                    update,
+                )
 
-            return web.json_response(
-                {"ok": False},
-                status=500,
-            )
+                return web.json_response(
+                    {"ok": True}
+                )
+
+            except asyncio.CancelledError:
+
+                raise
+
+            except Exception:
+
+                bot_main.log.exception(
+                    "Webhook update failed"
+                )
+
+                return web.json_response(
+                    {"ok": False},
+                    status=500,
+                )
+
+    # --------------------------------------------------------
+    # ROUTES
+    # --------------------------------------------------------
 
     http_app.router.add_get(
         "/",
@@ -182,41 +295,73 @@ async def create_http_app(
         webhook,
     )
 
+    # --------------------------------------------------------
+    # TELEGRAM WEBHOOK
+    # --------------------------------------------------------
+
     await app.bot.set_webhook(
         webhook_url,
         secret_token=secret,
         drop_pending_updates=False,
-        allowed_updates=app.dp.resolve_used_update_types(),
+        allowed_updates=(
+            app.dp.resolve_used_update_types()
+        ),
     )
 
     bot_main.log.info(
-        "Webhook configured"
+        "Webhook configured: %s",
+        webhook_url,
     )
 
     return http_app
 
 
+# ============================================================
+# MAIN
+# ============================================================
+
 async def main_async() -> None:
 
     app = bot_main.App()
 
+    runner: web.AppRunner | None = None
+
     try:
+
+        # ----------------------------------------------------
+        # START BOT SERVICES
+        # ----------------------------------------------------
+
         await prepare_app(app)
+
+        # ----------------------------------------------------
+        # CREATE HTTP APP
+        # ----------------------------------------------------
 
         http_app = await create_http_app(
             app
         )
 
+        # ----------------------------------------------------
+        # HTTP RUNNER
+        # ----------------------------------------------------
+
         runner = web.AppRunner(
-            http_app
+            http_app,
+            access_log=None,
         )
 
         await runner.setup()
+
+        # ----------------------------------------------------
+        # TCP SERVER
+        # ----------------------------------------------------
 
         site = web.TCPSite(
             runner,
             HOST,
             PORT,
+            reuse_address=True,
         )
 
         await site.start()
@@ -227,17 +372,33 @@ async def main_async() -> None:
             PORT,
         )
 
+        # ----------------------------------------------------
+        # KEEP PROCESS ALIVE
+        # ----------------------------------------------------
+
         stop_event = asyncio.Event()
 
-        try:
-            await stop_event.wait()
-
-        finally:
-            await runner.cleanup()
+        await stop_event.wait()
 
     finally:
+
+        if runner is not None:
+
+            try:
+                await runner.cleanup()
+
+            except Exception:
+
+                bot_main.log.exception(
+                    "HTTP runner cleanup failed"
+                )
+
         await cleanup_app(app)
 
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
     asyncio.run(
