@@ -1,168 +1,175 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+Telegram AI Bot
+============================================================
+
+Минимальная архитектура:
+
+Telegram
+   │
+   ├── обычный текст
+   │
+   ├── документы
+   │
+   └── изображения
+          │
+          ▼
+     File Processor
+          │
+          ▼
+       AI Queue
+          │
+          ▼
+      OdiRouter API
+          │
+          ▼
+      Telegram ответ
+
+
+ХРАНЕНИЕ:
+- никакой SQLite
+- пользователи -> JSON
+- история -> JSON
+- временные файлы -> удаляются после обработки
+
+АДМИН:
+- только рассылка:
+    /send текст сообщения
+
+ADMIN_TELEGRAM_IDS:
+- список Telegram ID администраторов
+
+Поддерживаемые файлы:
+- PDF
+- DOCX
+- XLSX
+- PPTX
+- JPG
+- JPEG
+- PNG
+- WEBP
+
+Остальные типы файлов отклоняются сразу.
+
+Переменные Render:
+
+BOT_TOKEN
+ADMIN_TELEGRAM_IDS
+
+AI_BASE_URL
+AI_API_KEY
+AI_MODEL_ID
+AI_MODEL_NAME
+
+SYSTEM_PROMPT
+
+MAX_FILE_SIZE_MB
+MAX_CONCURRENT_AI_REQUESTS
+MAX_CONCURRENT_FILE_PROCESSING
+AI_TIMEOUT_SECONDS
+
+HISTORY_COMPRESS_WORDS
+MAX_HISTORY_MESSAGES
+
+DATA_DIR
+"""
+
 from __future__ import annotations
 
 import asyncio
 import base64
 import json
 import logging
-import mimetypes
 import os
 import re
 import time
 import uuid
+
 from pathlib import Path
 from typing import Any, Optional
 
 import aiohttp
+
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramNetworkError,
+    TelegramRetryAfter,
+)
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
+    BufferedInputFile,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
 )
+
+from dotenv import load_dotenv
+
+# ------------------------------------------------------------
+# FILE PARSERS
+# ------------------------------------------------------------
+
+from pypdf import PdfReader
 from docx import Document
 from openpyxl import load_workbook
-from pypdf import PdfReader
 from pptx import Presentation
 
 
-# ============================================================================
-# CONFIG
-# ============================================================================
+# ============================================================
+# ENVIRONMENT
+# ============================================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+load_dotenv()
 
-AI_BASE_URL = os.getenv("AI_BASE_URL", "").strip().rstrip("/")
-AI_API_KEY = os.getenv("AI_API_KEY", "").strip()
-AI_MODEL_ID = os.getenv("AI_MODEL_ID", "").strip()
-AI_MODEL_NAME = os.getenv("AI_MODEL_NAME", AI_MODEL_ID or "AI").strip()
 
-SYSTEM_PROMPT = os.getenv(
-    "SYSTEM_PROMPT",
-    "Ты полезный AI-ассистент. Отвечай точно, понятно и по существу.",
-).strip()
-
-FREE_TOKEN_LIMIT = int(
-    os.getenv("FREE_TOKEN_LIMIT", "100000")
-)
-
-SUBSCRIPTION_TOKEN_LIMIT = int(
-    os.getenv("SUBSCRIPTION_TOKEN_LIMIT", "0")
-)
-
-RESET_PERIOD_SECONDS = int(
-    os.getenv("RESET_PERIOD_SECONDS", "21600")
-)
-
-MAX_HISTORY_MESSAGES = int(
-    os.getenv("MAX_HISTORY_MESSAGES", "30")
-)
-
-HISTORY_COMPRESS_WORDS = int(
-    os.getenv("HISTORY_COMPRESS_WORDS", "50000")
-)
-
-# Для 512 MB RAM / 0.1 CPU
-MAX_CONCURRENT_AI_REQUESTS = max(
-    1,
-    int(os.getenv("MAX_CONCURRENT_AI_REQUESTS", "2")),
-)
-
-MAX_CONCURRENT_FILE_PROCESSING = max(
-    1,
-    int(os.getenv("MAX_CONCURRENT_FILE_PROCESSING", "2")),
-)
-
-MAX_FILE_SIZE_MB = int(
-    os.getenv("MAX_FILE_SIZE_MB", "10")
-)
-
-MAX_FILE_SIZE_BYTES = (
-    MAX_FILE_SIZE_MB * 1024 * 1024
-)
-
-AI_TIMEOUT_SECONDS = int(
-    os.getenv("AI_TIMEOUT_SECONDS", "120")
-)
+BASE_DIR = Path(__file__).resolve().parent
 
 DATA_DIR = Path(
-    os.getenv("DATA_DIR", "data")
+    os.getenv(
+        "DATA_DIR",
+        str(BASE_DIR / "data"),
+    )
 )
 
-USERS_DIR = DATA_DIR / "users"
+USERS_FILE = DATA_DIR / "users.json"
+HISTORY_DIR = DATA_DIR / "history"
 FILES_DIR = DATA_DIR / "files"
 
-PURCHASE_USERNAME = "@PovilDurov"
 
+DATA_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
+)
 
-# ============================================================================
-# РАЗРЕШЁННЫЕ ФАЙЛЫ
-# ============================================================================
+HISTORY_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
+)
 
-# ВАЖНО:
-# Только эти расширения разрешены.
-# Всё остальное отклоняется ДО скачивания.
-
-ALLOWED_EXTENSIONS = {
-    ".pdf",
-    ".docx",
-    ".xlsx",
-    ".pptx",
-    ".txt",
-    ".csv",
-    ".jpg",
-    ".jpeg",
-    ".png",
-    ".webp",
-}
-
-ALLOWED_MIME_TYPES = {
-    "application/pdf",
-    "text/plain",
-    "text/csv",
-
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-
-    "image/jpeg",
-    "image/png",
-    "image/webp",
-}
-
-
-# ============================================================================
-# LOGGING
-# ============================================================================
-
-log = logging.getLogger("aitg")
-
-logging.basicConfig(
-    level=logging.INFO,
-    format=(
-        "%(asctime)s | "
-        "%(levelname)s | "
-        "%(name)s | "
-        "%(message)s"
-    ),
+FILES_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
 )
 
 
-# ============================================================================
-# ADMIN IDS
-# ============================================================================
+# ============================================================
+# BOT
+# ============================================================
 
-ADMIN_IDS: set[int] = set()
+BOT_TOKEN = os.getenv(
+    "BOT_TOKEN",
+    "",
+).strip()
 
 
 def parse_admin_ids() -> set[int]:
-
     raw = os.getenv(
         "ADMIN_TELEGRAM_IDS",
         "",
@@ -180,8 +187,11 @@ def parse_admin_ids() -> set[int]:
 
         value = value.strip()
 
+        if not value:
+            continue
+
         if value.startswith("+"):
-            value = value[1:]
+            value = value[1:].strip()
 
         if value.lstrip("-").isdigit():
             result.add(int(value))
@@ -189,580 +199,499 @@ def parse_admin_ids() -> set[int]:
     return result
 
 
-ADMIN_IDS.update(
-    parse_admin_ids()
+ADMIN_IDS: set[int] = parse_admin_ids()
+
+
+# ============================================================
+# AI
+# ============================================================
+
+AI_BASE_URL = os.getenv(
+    "AI_BASE_URL",
+    "",
+).strip().rstrip("/")
+
+
+AI_API_KEY = os.getenv(
+    "AI_API_KEY",
+    "",
+).strip()
+
+
+AI_MODEL_ID = os.getenv(
+    "AI_MODEL_ID",
+    "",
+).strip()
+
+
+AI_MODEL_NAME = os.getenv(
+    "AI_MODEL_NAME",
+    "AI",
+).strip()
+
+
+SYSTEM_PROMPT = os.getenv(
+    "SYSTEM_PROMPT",
+    "",
+).strip()
+
+
+# ============================================================
+# LIMITS / PERFORMANCE
+# ============================================================
+
+MAX_FILE_SIZE_MB = int(
+    os.getenv(
+        "MAX_FILE_SIZE_MB",
+        "10",
+    )
+)
+
+MAX_FILE_SIZE_BYTES = (
+    MAX_FILE_SIZE_MB * 1024 * 1024
 )
 
 
-# ============================================================================
-# HELPERS
-# ============================================================================
+MAX_CONCURRENT_AI_REQUESTS = max(
+    1,
+    int(
+        os.getenv(
+            "MAX_CONCURRENT_AI_REQUESTS",
+            "2",
+        )
+    ),
+)
 
-def now_ts() -> float:
-    return time.time()
+
+MAX_CONCURRENT_FILE_PROCESSING = max(
+    1,
+    int(
+        os.getenv(
+            "MAX_CONCURRENT_FILE_PROCESSING",
+            "2",
+        )
+    ),
+)
 
 
-def word_count(text: str) -> int:
+AI_TIMEOUT_SECONDS = max(
+    30,
+    int(
+        os.getenv(
+            "AI_TIMEOUT_SECONDS",
+            "120",
+        )
+    ),
+)
+
+
+HISTORY_COMPRESS_WORDS = max(
+    1000,
+    int(
+        os.getenv(
+            "HISTORY_COMPRESS_WORDS",
+            "50000",
+        )
+    ),
+)
+
+
+MAX_HISTORY_MESSAGES = max(
+    10,
+    int(
+        os.getenv(
+            "MAX_HISTORY_MESSAGES",
+            "100",
+        )
+    ),
+)
+
+
+# ============================================================
+# BROADCAST
+# ============================================================
+
+# Небольшая пауза между сообщениями рассылки.
+# Это специально не делает рассылку мгновенной.
+BROADCAST_DELAY = float(
+    os.getenv(
+        "BROADCAST_DELAY",
+        "0.05",
+    )
+)
+
+
+# Сколько одновременно отправляем максимум.
+BROADCAST_CONCURRENCY = max(
+    1,
+    int(
+        os.getenv(
+            "BROADCAST_CONCURRENCY",
+            "5",
+        )
+    ),
+)
+
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+LOG_LEVEL = os.getenv(
+    "LOG_LEVEL",
+    "INFO",
+).upper()
+
+
+logging.basicConfig(
+    level=getattr(
+        logging,
+        LOG_LEVEL,
+        logging.INFO,
+    ),
+    format=(
+        "%(asctime)s | "
+        "%(levelname)s | "
+        "%(name)s | "
+        "%(message)s"
+    ),
+)
+
+
+log = logging.getLogger(
+    "telegram_ai_bot"
+)
+
+
+# ============================================================
+# CONSTANTS
+# ============================================================
+
+ALLOWED_EXTENSIONS = {
+    ".pdf",
+    ".docx",
+    ".xlsx",
+    ".pptx",
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".webp",
+}
+
+
+ALLOWED_MIME_TYPES = {
+    "application/pdf",
+
+    "application/vnd.openxmlformats-officedocument"
+    ".wordprocessingml.document",
+
+    "application/vnd.openxmlformats-officedocument"
+    ".spreadsheetml.sheet",
+
+    "application/vnd.openxmlformats-officedocument"
+    ".presentationml.presentation",
+
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+}
+
+
+# ============================================================
+# TEXT HELPERS
+# ============================================================
+
+def clean_text(
+    text: str,
+) -> str:
+
+    text = text.replace(
+        "\x00",
+        "",
+    )
+
+    text = re.sub(
+        r"\n{4,}",
+        "\n\n\n",
+        text,
+    )
+
+    return text.strip()
+
+
+def count_words(
+    text: str,
+) -> int:
+
     return len(
         re.findall(
             r"\S+",
-            text or "",
+            text,
         )
     )
 
 
-def safe_filename(name: str) -> str:
-
-    name = Path(
-        name or "file"
-    ).name
-
-    name = re.sub(
-        r"[^\w.\- ()]+",
-        "_",
-        name,
-        flags=re.UNICODE,
-    )
-
-    return name[:180] or "file"
-
-
-def truncate_text(
+def escape_html(
     text: str,
-    limit: int = 120_000,
 ) -> str:
 
-    if len(text) <= limit:
-        return text
-
     return (
-        text[:limit]
-        + "\n\n"
-        "[Текст файла сокращён из-за лимита.]"
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
     )
 
 
-def format_seconds(seconds: int) -> str:
-
-    seconds = max(
-        0,
-        int(seconds),
-    )
-
-    if seconds < 60:
-        return f"{seconds} сек."
-
-    minutes = seconds // 60
-
-    if minutes < 60:
-        return f"{minutes} мин."
-
-    hours = minutes // 60
-    rest = minutes % 60
-
-    if rest:
-        return f"{hours} ч. {rest} мин."
-
-    return f"{hours} ч."
-
-
-def estimate_tokens(text: str) -> int:
-
-    if not text:
-        return 1
-
-    return max(
-        1,
-        len(text) // 4,
-    )
-
-
-def extract_usage(
-    data: dict[str, Any],
-) -> tuple[int, int]:
-
-    usage = data.get(
-        "usage"
-    ) or {}
-
-    input_tokens = int(
-        usage.get("prompt_tokens")
-        or usage.get("input_tokens")
-        or 0
-    )
-
-    output_tokens = int(
-        usage.get("completion_tokens")
-        or usage.get("output_tokens")
-        or 0
-    )
-
-    return (
-        input_tokens,
-        output_tokens,
-    )
-
-
-# ============================================================================
+# ============================================================
 # JSON STORAGE
-# ============================================================================
+# ============================================================
 
-class UserStore:
+class JSONStore:
 
-    def __init__(self):
-
-        USERS_DIR.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        FILES_DIR.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        self.global_lock = asyncio.Lock()
-
-    def path(
+    def __init__(
         self,
-        user_id: int,
-    ) -> Path:
+    ) -> None:
 
-        return (
-            USERS_DIR
-            / f"{user_id}.json"
-        )
+        self.lock = asyncio.Lock()
 
-    def default_state(
+    # --------------------------------------------------------
+    # USERS
+    # --------------------------------------------------------
+
+    async def _read_users(
         self,
-        user_id: int,
-    ) -> dict[str, Any]:
+    ) -> list[int]:
 
-        return {
-            "user_id": user_id,
-            "created_at": now_ts(),
-            "updated_at": now_ts(),
-
-            "subscription_until": 0,
-
-            "used_tokens": 0,
-            "period_started_at": now_ts(),
-
-            "history": [],
-            "compressed_summary": "",
-        }
-
-    def read_sync(
-        self,
-        user_id: int,
-    ) -> dict[str, Any]:
-
-        path = self.path(
-            user_id
-        )
-
-        if not path.exists():
-            return self.default_state(
-                user_id
-            )
+        if not USERS_FILE.exists():
+            return []
 
         try:
 
-            data = json.loads(
-                path.read_text(
-                    encoding="utf-8"
-                )
+            text = await asyncio.to_thread(
+                USERS_FILE.read_text,
+                encoding="utf-8",
             )
+
+            data = json.loads(text)
 
             if not isinstance(
                 data,
-                dict,
-            ):
-                return self.default_state(
-                    user_id
-                )
-
-            state = self.default_state(
-                user_id
-            )
-
-            state.update(
-                data
-            )
-
-            if not isinstance(
-                state.get("history"),
                 list,
             ):
-                state["history"] = []
+                return []
 
-            return state
+            result = []
+
+            for value in data:
+
+                try:
+                    result.append(
+                        int(value)
+                    )
+
+                except Exception:
+                    continue
+
+            return list(
+                dict.fromkeys(result)
+            )
 
         except Exception:
 
             log.exception(
-                "Ошибка чтения %s",
-                path,
+                "Failed to read users.json"
             )
 
-            return self.default_state(
-                user_id
-            )
+            return []
 
-    def write_sync(
+    async def _write_users(
         self,
-        user_id: int,
-        state: dict[str, Any],
-    ):
+        users: list[int],
+    ) -> None:
 
-        path = self.path(
-            user_id
-        )
-
-        temp_path = path.with_suffix(
-            ".tmp"
-        )
-
-        state["updated_at"] = now_ts()
-
-        temp_path.write_text(
-            json.dumps(
-                state,
-                ensure_ascii=False,
-                indent=2,
+        data = json.dumps(
+            sorted(
+                set(users)
             ),
+            ensure_ascii=False,
+            indent=2,
+        )
+
+        await asyncio.to_thread(
+            USERS_FILE.write_text,
+            data,
             encoding="utf-8",
         )
 
-        temp_path.replace(
-            path
-        )
-
-    async def get(
+    async def add_user(
         self,
         user_id: int,
-    ) -> dict[str, Any]:
+    ) -> None:
 
-        async with self.global_lock:
+        async with self.lock:
 
-            return await asyncio.to_thread(
-                self.read_sync,
-                user_id,
-            )
+            users = await self._read_users()
 
-    async def save(
-        self,
-        user_id: int,
-        state: dict[str, Any],
-    ):
+            if user_id not in users:
 
-        async with self.global_lock:
-
-            await asyncio.to_thread(
-                self.write_sync,
-                user_id,
-                state,
-            )
-
-    async def get_or_create(
-        self,
-        user_id: int,
-    ) -> dict[str, Any]:
-
-        state = await self.get(
-            user_id
-        )
-
-        await self.save(
-            user_id,
-            state,
-        )
-
-        return state
-
-    async def all_user_ids(self) -> list[int]:
-
-        result = []
-
-        for path in USERS_DIR.glob(
-            "*.json"
-        ):
-
-            try:
-                result.append(
-                    int(path.stem)
+                users.append(
+                    user_id
                 )
-            except ValueError:
-                pass
 
-        return result
+                await self._write_users(
+                    users
+                )
 
-
-# ============================================================================
-# LIMITS
-# ============================================================================
-
-class Limits:
-
-    def __init__(
+    async def remove_user(
         self,
-        store: UserStore,
-    ):
+        user_id: int,
+    ) -> None:
 
-        self.store = store
+        async with self.lock:
 
-    @staticmethod
-    def has_subscription(
-        state: dict[str, Any],
-    ) -> bool:
+            users = await self._read_users()
+
+            if user_id in users:
+
+                users.remove(
+                    user_id
+                )
+
+                await self._write_users(
+                    users
+                )
+
+    async def get_users(
+        self,
+    ) -> list[int]:
+
+        async with self.lock:
+
+            return await self._read_users()
+
+    # --------------------------------------------------------
+    # HISTORY
+    # --------------------------------------------------------
+
+    def history_path(
+        self,
+        user_id: int,
+    ) -> Path:
 
         return (
-            float(
-                state.get(
-                    "subscription_until",
-                    0,
-                )
-            )
-            > now_ts()
+            HISTORY_DIR
+            / f"{user_id}.json"
         )
 
-    async def refresh_period(
+    async def get_history(
         self,
         user_id: int,
-        state: dict[str, Any],
-    ) -> dict[str, Any]:
+    ) -> list[dict[str, Any]]:
 
-        started = float(
-            state.get(
-                "period_started_at",
-                0,
-            )
-        )
-
-        current = now_ts()
-
-        if started <= 0:
-
-            state["period_started_at"] = current
-            state["used_tokens"] = 0
-
-            await self.store.save(
-                user_id,
-                state,
-            )
-
-            return state
-
-        if (
-            current - started
-            >= RESET_PERIOD_SECONDS
-        ):
-
-            state["period_started_at"] = current
-            state["used_tokens"] = 0
-
-            await self.store.save(
-                user_id,
-                state,
-            )
-
-        return state
-
-    async def allowed(
-        self,
-        user_id: int,
-    ) -> tuple[bool, int]:
-
-        state = await self.store.get_or_create(
+        path = self.history_path(
             user_id
         )
 
-        state = await self.refresh_period(
-            user_id,
-            state,
-        )
+        if not path.exists():
+            return []
 
-        subscribed = self.has_subscription(
-            state
-        )
+        try:
 
-        limit = (
-            SUBSCRIPTION_TOKEN_LIMIT
-            if subscribed
-            else FREE_TOKEN_LIMIT
-        )
-
-        used = int(
-            state.get(
-                "used_tokens",
-                0,
-            )
-        )
-
-        if limit <= 0:
-            return True, 0
-
-        if used >= limit:
-
-            reset_at = int(
-                float(
-                    state.get(
-                        "period_started_at",
-                        now_ts(),
-                    )
-                )
-                + RESET_PERIOD_SECONDS
+            text = await asyncio.to_thread(
+                path.read_text,
+                encoding="utf-8",
             )
 
-            return False, reset_at
+            data = json.loads(
+                text
+            )
 
-        return True, 0
+            if not isinstance(
+                data,
+                list,
+            ):
+                return []
 
-    async def add_tokens(
+            return data
+
+        except Exception:
+
+            log.exception(
+                "Failed to read history for %s",
+                user_id,
+            )
+
+            return []
+
+    async def save_history(
         self,
         user_id: int,
-        amount: int,
-    ):
+        history: list[dict[str, Any]],
+    ) -> None:
 
-        if amount <= 0:
-            return
-
-        state = await self.store.get_or_create(
+        path = self.history_path(
             user_id
         )
 
-        state["used_tokens"] = (
-            int(
-                state.get(
-                    "used_tokens",
-                    0,
-                )
-            )
-            + amount
+        data = json.dumps(
+            history,
+            ensure_ascii=False,
+            indent=2,
         )
 
-        await self.store.save(
-            user_id,
-            state,
+        await asyncio.to_thread(
+            path.write_text,
+            data,
+            encoding="utf-8",
         )
 
 
-# ============================================================================
+# ============================================================
 # FILE PROCESSOR
-# ============================================================================
-
-class UnsupportedFile(Exception):
-    pass
-
-
-class FileTooLarge(Exception):
-    pass
-
+# ============================================================
 
 class FileProcessor:
 
-    def __init__(self):
+    def __init__(
+        self,
+    ) -> None:
 
-        # Обработка файлов отдельная от AI.
         self.semaphore = asyncio.Semaphore(
             MAX_CONCURRENT_FILE_PROCESSING
         )
 
+    # --------------------------------------------------------
+    # CHECK
+    # --------------------------------------------------------
+
     @staticmethod
     def allowed(
-        name: str,
-        mime: str = "",
+        filename: str,
+        mime: str,
     ) -> bool:
 
-        extension = Path(
-            name or ""
-        ).suffix.lower()
+        extension = (
+            Path(filename)
+            .suffix
+            .lower()
+        )
 
-        # Расширение является главным фильтром.
         if extension in ALLOWED_EXTENSIONS:
             return True
 
-        # Если расширение отсутствует,
-        # разрешаем только известные MIME.
-        if (
-            not extension
-            and mime.lower() in ALLOWED_MIME_TYPES
-        ):
+        if mime in ALLOWED_MIME_TYPES:
             return True
 
         return False
 
-    @staticmethod
-    def is_image(
-        name: str,
-        mime: str,
-    ) -> bool:
-
-        extension = Path(
-            name or ""
-        ).suffix.lower()
-
-        return (
-            extension
-            in {
-                ".jpg",
-                ".jpeg",
-                ".png",
-                ".webp",
-            }
-            or mime.startswith(
-                "image/"
-            )
-        )
-
-    async def download(
-        self,
-        bot: Bot,
-        file_id: str,
-        original_name: str,
-        file_size: Optional[int],
-    ) -> Path:
-
-        if (
-            file_size is not None
-            and file_size > MAX_FILE_SIZE_BYTES
-        ):
-            raise FileTooLarge
-
-        filename = safe_filename(
-            original_name
-        )
-
-        path = (
-            FILES_DIR
-            / f"{uuid.uuid4().hex}_{filename}"
-        )
-
-        telegram_file = await bot.get_file(
-            file_id
-        )
-
-        await bot.download_file(
-            telegram_file.file_path,
-            destination=path,
-        )
-
-        actual_size = path.stat().st_size
-
-        if actual_size > MAX_FILE_SIZE_BYTES:
-
-            path.unlink(
-                missing_ok=True
-            )
-
-            raise FileTooLarge
-
-        return path
+    # --------------------------------------------------------
+    # PROCESS
+    # --------------------------------------------------------
 
     async def process(
         self,
         path: Path,
-        original_name: str,
+        filename: str,
         mime: str,
     ) -> dict[str, Any]:
 
@@ -771,9 +700,10 @@ class FileProcessor:
             try:
 
                 return await asyncio.wait_for(
-                    self._process_inner(
+                    asyncio.to_thread(
+                        self._process_sync,
                         path,
-                        original_name,
+                        filename,
                         mime,
                     ),
                     timeout=AI_TIMEOUT_SECONDS,
@@ -781,121 +711,233 @@ class FileProcessor:
 
             finally:
 
-                path.unlink(
-                    missing_ok=True
-                )
+                try:
+                    path.unlink(
+                        missing_ok=True
+                    )
 
-    async def _process_inner(
+                except Exception:
+
+                    log.exception(
+                        "Failed to delete temp file"
+                    )
+
+    # --------------------------------------------------------
+    # SYNC PROCESSOR
+    # --------------------------------------------------------
+
+    def _process_sync(
         self,
         path: Path,
-        original_name: str,
+        filename: str,
         mime: str,
     ) -> dict[str, Any]:
 
-        extension = Path(
-            original_name
-        ).suffix.lower()
+        extension = (
+            Path(filename)
+            .suffix
+            .lower()
+        )
 
-        # Повторная проверка.
-        if not self.allowed(
-            original_name,
-            mime,
-        ):
-            raise UnsupportedFile
-
-        # TXT / CSV
-        if extension in {
-            ".txt",
-            ".csv",
-        }:
-
-            text = await asyncio.to_thread(
-                path.read_text,
-                encoding="utf-8",
-                errors="replace",
-            )
-
-            return {
-                "kind": "text",
-                "name": original_name,
-                "text": truncate_text(
-                    text
-                ),
-            }
-
+        # ----------------------------------------------------
         # PDF
+        # ----------------------------------------------------
+
         if extension == ".pdf":
 
-            text = await asyncio.to_thread(
-                self.read_pdf,
-                path,
+            reader = PdfReader(
+                str(path)
             )
 
+            pages = []
+
+            for page in reader.pages:
+
+                try:
+
+                    text = page.extract_text()
+
+                    if text:
+                        pages.append(
+                            text
+                        )
+
+                except Exception:
+                    continue
+
             return {
-                "kind": "text",
-                "name": original_name,
-                "text": truncate_text(
-                    text
+                "type": "text",
+                "filename": filename,
+                "text": clean_text(
+                    "\n\n".join(pages)
                 ),
             }
 
+        # ----------------------------------------------------
         # DOCX
+        # ----------------------------------------------------
+
         if extension == ".docx":
 
-            text = await asyncio.to_thread(
-                self.read_docx,
-                path,
+            document = Document(
+                str(path)
             )
 
+            parts = []
+
+            for paragraph in document.paragraphs:
+
+                text = paragraph.text.strip()
+
+                if text:
+                    parts.append(
+                        text
+                    )
+
+            # Таблицы DOCX
+            for table in document.tables:
+
+                rows = []
+
+                for row in table.rows:
+
+                    cells = [
+                        cell.text.strip()
+                        for cell in row.cells
+                    ]
+
+                    rows.append(
+                        " | ".join(cells)
+                    )
+
+                if rows:
+                    parts.append(
+                        "\n".join(rows)
+                    )
+
             return {
-                "kind": "text",
-                "name": original_name,
-                "text": truncate_text(
-                    text
+                "type": "text",
+                "filename": filename,
+                "text": clean_text(
+                    "\n\n".join(parts)
                 ),
             }
 
+        # ----------------------------------------------------
         # XLSX
+        # ----------------------------------------------------
+
         if extension == ".xlsx":
 
-            text = await asyncio.to_thread(
-                self.read_xlsx,
-                path,
+            workbook = load_workbook(
+                filename=str(path),
+                read_only=True,
+                data_only=True,
             )
 
+            parts = []
+
+            for sheet in workbook.worksheets:
+
+                parts.append(
+                    f"Лист: {sheet.title}"
+                )
+
+                for row in sheet.iter_rows(
+                    values_only=True
+                ):
+
+                    values = []
+
+                    for value in row:
+
+                        if value is None:
+                            values.append("")
+                        else:
+                            values.append(
+                                str(value)
+                            )
+
+                    if any(values):
+
+                        parts.append(
+                            " | ".join(values)
+                        )
+
+            workbook.close()
+
             return {
-                "kind": "text",
-                "name": original_name,
-                "text": truncate_text(
-                    text
+                "type": "text",
+                "filename": filename,
+                "text": clean_text(
+                    "\n".join(parts)
                 ),
             }
 
+        # ----------------------------------------------------
         # PPTX
+        # ----------------------------------------------------
+
         if extension == ".pptx":
 
-            text = await asyncio.to_thread(
-                self.read_pptx,
-                path,
+            presentation = Presentation(
+                str(path)
             )
 
+            parts = []
+
+            for index, slide in enumerate(
+                presentation.slides,
+                start=1,
+            ):
+
+                slide_parts = [
+                    f"Слайд {index}:"
+                ]
+
+                for shape in slide.shapes:
+
+                    if hasattr(
+                        shape,
+                        "text",
+                    ):
+
+                        text = (
+                            shape.text
+                            .strip()
+                        )
+
+                        if text:
+                            slide_parts.append(
+                                text
+                            )
+
+                parts.append(
+                    "\n".join(
+                        slide_parts
+                    )
+                )
+
             return {
-                "kind": "text",
-                "name": original_name,
-                "text": truncate_text(
-                    text
+                "type": "text",
+                "filename": filename,
+                "text": clean_text(
+                    "\n\n".join(parts)
                 ),
             }
 
-        # IMAGE
-        if self.is_image(
-            original_name,
-            mime,
-        ):
+        # ----------------------------------------------------
+        # IMAGES
+        # ----------------------------------------------------
 
-            raw = await asyncio.to_thread(
-                path.read_bytes
-            )
+        if extension in {
+            ".jpg",
+            ".jpeg",
+            ".png",
+            ".webp",
+        }:
+
+            raw = path.read_bytes()
 
             encoded = base64.b64encode(
                 raw
@@ -903,218 +945,57 @@ class FileProcessor:
                 "ascii"
             )
 
-            image_mime = mime
+            if extension in {
+                ".jpg",
+                ".jpeg",
+            }:
+                image_mime = "image/jpeg"
 
-            if not image_mime.startswith(
-                "image/"
-            ):
-                image_mime = (
-                    mimetypes.guess_type(
-                        original_name
-                    )[0]
-                    or "image/jpeg"
-                )
+            elif extension == ".png":
+                image_mime = "image/png"
+
+            else:
+                image_mime = "image/webp"
 
             return {
-                "kind": "image",
-                "name": original_name,
+                "type": "image",
+                "filename": filename,
                 "data_url": (
                     f"data:{image_mime};"
                     f"base64,{encoded}"
                 ),
             }
 
-        raise UnsupportedFile
-
-    @staticmethod
-    def read_pdf(
-        path: Path,
-    ) -> str:
-
-        reader = PdfReader(
-            str(path)
-        )
-
-        result = []
-
-        for index, page in enumerate(
-            reader.pages,
-            start=1,
-        ):
-
-            try:
-
-                text = (
-                    page.extract_text()
-                    or ""
-                )
-
-            except Exception as exc:
-
-                text = (
-                    f"[Ошибка чтения страницы "
-                    f"{index}: {exc}]"
-                )
-
-            if text.strip():
-
-                result.append(
-                    f"--- Страница {index} ---\n"
-                    f"{text}"
-                )
-
-        return "\n\n".join(
-            result
-        )
-
-    @staticmethod
-    def read_docx(
-        path: Path,
-    ) -> str:
-
-        document = Document(
-            str(path)
-        )
-
-        result = []
-
-        for paragraph in document.paragraphs:
-
-            text = paragraph.text.strip()
-
-            if text:
-                result.append(text)
-
-        for table in document.tables:
-
-            for row in table.rows:
-
-                result.append(
-                    " | ".join(
-                        cell.text
-                        for cell in row.cells
-                    )
-                )
-
-        return "\n".join(
-            result
-        )
-
-    @staticmethod
-    def read_xlsx(
-        path: Path,
-    ) -> str:
-
-        workbook = load_workbook(
-            str(path),
-            read_only=True,
-            data_only=True,
-        )
-
-        result = []
-
-        try:
-
-            for sheet in workbook.worksheets:
-
-                result.append(
-                    f"--- Лист: {sheet.title} ---"
-                )
-
-                for row in sheet.iter_rows(
-                    values_only=True
-                ):
-
-                    values = [
-                        ""
-                        if value is None
-                        else str(value)
-                        for value in row
-                    ]
-
-                    if any(
-                        value.strip()
-                        for value in values
-                    ):
-
-                        result.append(
-                            " | ".join(values)
-                        )
-
-        finally:
-
-            workbook.close()
-
-        return "\n".join(
-            result
-        )
-
-    @staticmethod
-    def read_pptx(
-        path: Path,
-    ) -> str:
-
-        presentation = Presentation(
-            str(path)
-        )
-
-        result = []
-
-        for slide_number, slide in enumerate(
-            presentation.slides,
-            start=1,
-        ):
-
-            slide_text = []
-
-            for shape in slide.shapes:
-
-                if hasattr(
-                    shape,
-                    "text",
-                ):
-
-                    text = (
-                        shape.text
-                        or ""
-                    ).strip()
-
-                    if text:
-                        slide_text.append(
-                            text
-                        )
-
-            if slide_text:
-
-                result.append(
-                    f"--- Слайд {slide_number} ---\n"
-                    + "\n".join(
-                        slide_text
-                    )
-                )
-
-        return "\n\n".join(
-            result
+        raise ValueError(
+            "Unsupported file type"
         )
 
 
-# ============================================================================
+# ============================================================
 # AI SERVICE
-# ============================================================================
-
-class AIError(Exception):
-    pass
-
+# ============================================================
 
 class AIService:
 
-    def __init__(self):
+    def __init__(
+        self,
+    ) -> None:
 
         self.session: Optional[
             aiohttp.ClientSession
         ] = None
 
-    async def start(self):
+        self.semaphore = asyncio.Semaphore(
+            MAX_CONCURRENT_AI_REQUESTS
+        )
+
+    # --------------------------------------------------------
+    # START
+    # --------------------------------------------------------
+
+    async def start(
+        self,
+    ) -> None:
 
         timeout = aiohttp.ClientTimeout(
             total=AI_TIMEOUT_SECONDS
@@ -1123,16 +1004,20 @@ class AIService:
         self.session = aiohttp.ClientSession(
             timeout=timeout,
             headers={
-                "Authorization": (
-                    f"Bearer {AI_API_KEY}"
-                ),
-                "Content-Type": (
-                    "application/json"
-                ),
+                "Authorization":
+                    f"Bearer {AI_API_KEY}",
+                "Content-Type":
+                    "application/json",
             },
         )
 
-    async def close(self):
+    # --------------------------------------------------------
+    # CLOSE
+    # --------------------------------------------------------
+
+    async def close(
+        self,
+    ) -> None:
 
         if self.session:
 
@@ -1140,467 +1025,187 @@ class AIService:
 
             self.session = None
 
-    def system_prompt(self) -> str:
+    # --------------------------------------------------------
+    # SYSTEM PROMPT
+    # --------------------------------------------------------
+
+    def get_system_prompt(
+        self,
+    ) -> str:
+
+        if SYSTEM_PROMPT:
+
+            return (
+                f"Ты — {AI_MODEL_NAME}, "
+                "AI-модель внутри Telegram-бота.\n\n"
+                f"{SYSTEM_PROMPT}"
+            )
 
         return (
             f"Ты — {AI_MODEL_NAME}, "
-            "AI-модель, работающая "
-            "внутри Telegram-бота.\n\n"
-            f"{SYSTEM_PROMPT}"
+            "AI-модель внутри Telegram-бота. "
+            "Отвечай полезно, точно и понятно."
         )
 
-    async def request(
+    # --------------------------------------------------------
+    # NORMALIZE MESSAGES
+    # --------------------------------------------------------
+
+    def normalize_messages(
         self,
         messages: list[dict[str, Any]],
-        *,
-        temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None,
-    ) -> tuple[str, dict[str, Any]]:
-
-        if not self.session:
-            raise AIError(
-                "AI service не запущен."
-            )
-
-        # ------------------------------------------------------------
-        # SYSTEM ОБЯЗАТЕЛЬНО ПЕРВЫМ
-        # ------------------------------------------------------------
+    ) -> list[dict[str, Any]]:
 
         system_messages = [
             message
             for message in messages
-            if message.get("role") == "system"
+            if message.get("role")
+            == "system"
         ]
 
         other_messages = [
             message
             for message in messages
-            if message.get("role") != "system"
+            if message.get("role")
+            != "system"
         ]
-
-        final_messages = []
 
         if system_messages:
 
-            final_messages.append(
-                system_messages[0]
+            return [
+                system_messages[0],
+                *other_messages,
+            ]
+
+        return [
+            {
+                "role": "system",
+                "content":
+                    self.get_system_prompt(),
+            },
+            *other_messages,
+        ]
+
+    # --------------------------------------------------------
+    # REQUEST
+    # --------------------------------------------------------
+
+    async def request(
+        self,
+        messages: list[dict[str, Any]],
+        temperature: float = 0.7,
+    ) -> str:
+
+        if not self.session:
+            raise RuntimeError(
+                "AI service is not started"
             )
 
-        else:
-
-            final_messages.append({
-                "role": "system",
-                "content": self.system_prompt(),
-            })
-
-        final_messages.extend(
-            other_messages
-        )
-
-        payload: dict[str, Any] = {
+        payload = {
             "model": AI_MODEL_ID,
-            "messages": final_messages,
+            "messages": self.normalize_messages(
+                messages
+            ),
+            "temperature": temperature,
         }
-
-        if temperature is not None:
-            payload["temperature"] = temperature
-
-        if max_tokens is not None:
-            payload["max_tokens"] = max_tokens
 
         url = (
             f"{AI_BASE_URL}"
             "/chat/completions"
         )
 
-        try:
+        async with self.semaphore:
 
-            async with self.session.post(
-                url,
-                json=payload,
-            ) as response:
+            try:
 
-                raw = await response.text()
+                async with self.session.post(
+                    url,
+                    json=payload,
+                ) as response:
 
-                if response.status >= 400:
+                    text = await response.text()
 
-                    raise AIError(
-                        f"AI API error "
-                        f"{response.status}: "
-                        f"{raw[:3000]}"
-                    )
+                    if response.status >= 400:
 
-                try:
+                        raise RuntimeError(
+                            f"AI API error "
+                            f"{response.status}: "
+                            f"{text[:2000]}"
+                        )
 
-                    data = json.loads(
-                        raw
-                    )
+                    try:
 
-                except json.JSONDecodeError:
+                        data = json.loads(
+                            text
+                        )
 
-                    raise AIError(
-                        "AI API вернул "
-                        "некорректный JSON."
-                    )
+                    except json.JSONDecodeError:
 
-                choices = (
-                    data.get(
+                        raise RuntimeError(
+                            "AI API returned "
+                            "invalid JSON"
+                        )
+
+                    choices = data.get(
                         "choices"
                     )
-                    or []
-                )
 
-                if not choices:
+                    if not choices:
+                        raise RuntimeError(
+                            "AI API returned "
+                            "no choices"
+                        )
 
-                    raise AIError(
-                        "AI API не вернул choices."
+                    message = choices[0].get(
+                        "message",
+                        {},
                     )
 
-                assistant_message = (
-                    choices[0].get(
-                        "message"
-                    )
-                    or {}
-                )
-
-                content = (
-                    assistant_message.get(
+                    content = message.get(
                         "content"
                     )
-                )
 
-                if isinstance(
-                    content,
-                    list,
-                ):
+                    if isinstance(
+                        content,
+                        list,
+                    ):
 
-                    content = "".join(
-                        part.get(
-                            "text",
-                            "",
+                        parts = []
+
+                        for item in content:
+
+                            if isinstance(
+                                item,
+                                dict,
+                            ):
+
+                                if item.get(
+                                    "type"
+                                ) == "text":
+
+                                    parts.append(
+                                        str(
+                                            item.get(
+                                                "text",
+                                                "",
+                                            )
+                                        )
+                                    )
+
+                        content = "\n".join(
+                            parts
                         )
-                        for part in content
-                        if isinstance(
-                            part,
-                            dict,
+
+                    if not content:
+
+                        raise RuntimeError(
+                            "AI returned empty "
+                            "response"
                         )
-                    )
 
-                if not isinstance(
-                    content,
-                    str,
-                ):
-
-                    content = str(
-                        content or ""
-                    )
-
-                return (
-                    content.strip(),
-                    data,
-                )
-
-        except asyncio.TimeoutError as exc:
-
-            raise AIError(
-                "AI API превысил таймаут."
-            ) from exc
-
-        except aiohttp.ClientError as exc:
-
-            raise AIError(
-                f"Ошибка соединения с AI API: "
-                f"{exc}"
-            ) from exc
-
-    async def hidden_plan(
-        self,
-        history: list[dict[str, Any]],
-        user_text: str,
-        file_context: str = "",
-    ) -> tuple[str, dict[str, Any]]:
-
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    self.system_prompt()
-                    + "\n\n"
-                    "Ты выполняешь скрытый этап "
-                    "планирования. Пользователь "
-                    "этот этап НЕ увидит. "
-                    "Кратко определи, как лучше "
-                    "решить задачу. "
-                    "Не отвечай пользователю."
-                ),
-            }
-        ]
-
-        messages.extend(
-            history
-        )
-
-        content = user_text
-
-        if file_context:
-
-            content += (
-                "\n\nКонтекст файла:\n"
-                + file_context
-            )
-
-        messages.append({
-            "role": "user",
-            "content": content,
-        })
-
-        return await self.request(
-            messages,
-            temperature=0.2,
-            max_tokens=1200,
-        )
-
-    async def answer(
-        self,
-        history: list[dict[str, Any]],
-        user_text: str,
-        plan: str,
-        file_context: str = "",
-        image_data_url: Optional[str] = None,
-    ) -> tuple[str, dict[str, Any]]:
-
-        messages = [
-            {
-                "role": "system",
-                "content": self.system_prompt(),
-            }
-        ]
-
-        messages.extend(
-            history
-        )
-
-        context = []
-
-        if plan:
-
-            context.append(
-                "Скрытый план:\n"
-                + plan
-            )
-
-        if file_context:
-
-            context.append(
-                "Текст файла:\n"
-                + file_context
-            )
-
-        final_text = user_text
-
-        if context:
-
-            final_text += (
-                "\n\n"
-                + "\n\n".join(
-                    context
-                )
-            )
-
-        if image_data_url:
-
-            messages.append({
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": final_text,
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": image_data_url,
-                        },
-                    },
-                ],
-            })
-
-        else:
-
-            messages.append({
-                "role": "user",
-                "content": final_text,
-            })
-
-        return await self.request(
-            messages,
-            temperature=0.7,
-        )
-
-    async def compress_history(
-        self,
-        history: list[dict[str, Any]],
-        old_summary: str,
-    ) -> tuple[str, dict[str, Any]]:
-
-        parts = []
-
-        if old_summary:
-
-            parts.append(
-                "Предыдущая сводка:\n"
-                + old_summary
-            )
-
-        for item in history:
-
-            role = item.get(
-                "role",
-                "",
-            )
-
-            content = item.get(
-                "content",
-                "",
-            )
-
-            if not isinstance(
-                content,
-                str,
-            ):
-
-                content = (
-                    "[мультимодальное сообщение]"
-                )
-
-            parts.append(
-                f"{role}: {content}"
-            )
-
-        prompt = (
-            "Сожми историю разговора "
-            "для дальнейшего продолжения. "
-            "Сохрани важные факты, решения, "
-            "предпочтения пользователя "
-            "и незавершённые задачи. "
-            "Не придумывай информацию. "
-            "Верни только компактную сводку.\n\n"
-            + "\n".join(parts)
-        )
-
-        return await self.request(
-            [
-                {
-                    "role": "system",
-                    "content": (
-                        self.system_prompt()
-                        + "\n\n"
-                        "Это внутреннее сжатие "
-                        "истории."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": prompt,
-                },
-            ],
-            temperature=0.1,
-            max_tokens=3000,
-        )
-
-
-# ============================================================================
-# AI QUEUE
-# ============================================================================
-
-class AIQueue:
-
-    def __init__(
-        self,
-        handler,
-    ):
-
-        self.handler = handler
-
-        self.queue: asyncio.Queue[
-            tuple[int, dict[str, Any]]
-        ] = asyncio.Queue()
-
-        self.workers: list[
-            asyncio.Task
-        ] = []
-
-        self.running = False
-
-    async def start(self):
-
-        if self.running:
-            return
-
-        self.running = True
-
-        for index in range(
-            MAX_CONCURRENT_AI_REQUESTS
-        ):
-
-            task = asyncio.create_task(
-                self.worker(),
-                name=f"ai-worker-{index + 1}",
-            )
-
-            self.workers.append(
-                task
-            )
-
-    async def stop(self):
-
-        self.running = False
-
-        for task in self.workers:
-            task.cancel()
-
-        for task in self.workers:
-
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
-        self.workers.clear()
-
-    async def put(
-        self,
-        user_id: int,
-        payload: dict[str, Any],
-    ):
-
-        await self.queue.put(
-            (
-                user_id,
-                payload,
-            )
-        )
-
-    async def worker(self):
-
-        while self.running:
-
-            try:
-
-                user_id, payload = (
-                    await self.queue.get()
-                )
-
-            except asyncio.CancelledError:
-
-                raise
-
-            try:
-
-                await self.handler(
-                    user_id,
-                    payload,
-                )
+                    return str(
+                        content
+                    ).strip()
 
             except asyncio.CancelledError:
 
@@ -1609,213 +1214,337 @@ class AIQueue:
             except Exception:
 
                 log.exception(
-                    "Ошибка AI job "
-                    "для %s",
-                    user_id,
+                    "AI request failed"
                 )
 
-            finally:
-
-                self.queue.task_done()
+                raise
 
 
-# ============================================================================
+# ============================================================
+# AI QUEUE
+# ============================================================
+
+class AIQueue:
+
+    def __init__(
+        self,
+        ai: AIService,
+    ) -> None:
+
+        self.ai = ai
+
+        self.queue: asyncio.Queue[
+            tuple[
+                int,
+                list[dict[str, Any]],
+                asyncio.Future,
+            ]
+        ] = asyncio.Queue()
+
+        self.workers: list[
+            asyncio.Task
+        ] = []
+
+        self.running = False
+
+    # --------------------------------------------------------
+    # START
+    # --------------------------------------------------------
+
+    async def start(
+        self,
+    ) -> None:
+
+        if self.running:
+            return
+
+        self.running = True
+
+        worker_count = (
+            MAX_CONCURRENT_AI_REQUESTS
+        )
+
+        for index in range(
+            worker_count
+        ):
+
+            task = asyncio.create_task(
+                self.worker(),
+                name=(
+                    f"ai-worker-{index + 1}"
+                ),
+            )
+
+            self.workers.append(
+                task
+            )
+
+    # --------------------------------------------------------
+    # STOP
+    # --------------------------------------------------------
+
+    async def stop(
+        self,
+    ) -> None:
+
+        self.running = False
+
+        tasks = list(
+            self.workers
+        )
+
+        self.workers.clear()
+
+        for task in tasks:
+
+            task.cancel()
+
+        for task in tasks:
+
+            try:
+
+                await task
+
+            except asyncio.CancelledError:
+
+                pass
+
+    # --------------------------------------------------------
+    # PUT
+    # --------------------------------------------------------
+
+    async def put(
+        self,
+        user_id: int,
+        messages: list[dict[str, Any]],
+    ) -> asyncio.Future:
+
+        loop = asyncio.get_running_loop()
+
+        future = loop.create_future()
+
+        await self.queue.put(
+            (
+                user_id,
+                messages,
+                future,
+            )
+        )
+
+        return future
+
+    # --------------------------------------------------------
+    # WORKER
+    # --------------------------------------------------------
+
+    async def worker(
+        self,
+    ) -> None:
+
+        while self.running:
+
+            try:
+
+                (
+                    user_id,
+                    messages,
+                    future,
+                ) = await self.queue.get()
+
+                try:
+
+                    if future.cancelled():
+                        continue
+
+                    result = await self.ai.request(
+                        messages
+                    )
+
+                    if not future.done():
+
+                        future.set_result(
+                            result
+                        )
+
+                except asyncio.CancelledError:
+
+                    if not future.done():
+
+                        future.cancel()
+
+                    raise
+
+                except Exception as exc:
+
+                    if not future.done():
+
+                        future.set_exception(
+                            exc
+                        )
+
+                finally:
+
+                    self.queue.task_done()
+
+            except asyncio.CancelledError:
+
+                raise
+
+            except Exception:
+
+                log.exception(
+                    "AI queue worker failed"
+                )
+
+
+# ============================================================
 # BOT APP
-# ============================================================================
+# ============================================================
 
 class BotApp:
 
-    def __init__(self):
+    def __init__(
+        self,
+    ) -> None:
 
         self.bot = Bot(
-            BOT_TOKEN,
+            token=BOT_TOKEN,
             default=DefaultBotProperties(
-                parse_mode=ParseMode.HTML
+                parse_mode=ParseMode.HTML,
             ),
         )
 
         self.dp = Dispatcher()
+
         self.router = Router()
-
-        self.store = UserStore()
-        self.limits = Limits(
-            self.store
-        )
-
-        self.files = FileProcessor()
-        self.ai = AIService()
-
-        self.queue = AIQueue(
-            self.run_ai_job
-        )
-
-        # ------------------------------------------------------------
-        # Один активный запрос на одного пользователя.
-        # ------------------------------------------------------------
-
-        self.active_tasks: dict[
-            int,
-            asyncio.Task
-        ] = {}
-
-        # ------------------------------------------------------------
-        # COMMANDS
-        # ------------------------------------------------------------
-
-        self.router.message.register(
-            self.handle_start,
-            CommandStart(),
-        )
-
-        self.router.message.register(
-            self.handle_admin_command,
-            Command(
-                commands=[
-                    "admin",
-                    "give_subscription",
-                    "set_subscription",
-                    "delete_subscription",
-                    "subscription",
-                    "broadcast",
-                ]
-            ),
-        )
-
-        self.router.message.register(
-            self.handle_stop_command,
-            Command(
-                commands=[
-                    "stop"
-                ]
-            ),
-        )
-
-        # ------------------------------------------------------------
-        # ДОКУМЕНТЫ
-        # ------------------------------------------------------------
-
-        self.router.message.register(
-            self.handle_document,
-            F.document,
-        )
-
-        # ------------------------------------------------------------
-        # ФОТО
-        # ------------------------------------------------------------
-
-        self.router.message.register(
-            self.handle_photo,
-            F.photo,
-        )
-
-        # ------------------------------------------------------------
-        # ВСЁ НЕПОДДЕРЖИВАЕМОЕ
-        # ------------------------------------------------------------
-
-        self.router.message.register(
-            self.handle_unsupported_media,
-            F.video
-            | F.video_note
-            | F.audio
-            | F.voice
-            | F.animation,
-        )
-
-        # ------------------------------------------------------------
-        # ТЕКСТ
-        # ------------------------------------------------------------
-
-        self.router.message.register(
-            self.handle_text,
-            F.text,
-        )
-
-        # ------------------------------------------------------------
-        # CALLBACKS
-        # ------------------------------------------------------------
-
-        self.router.callback_query.register(
-            self.handle_callback,
-        )
 
         self.dp.include_router(
             self.router
         )
 
-    # =========================================================================
-    # START / STOP
-    # =========================================================================
+        self.store = JSONStore()
 
-    async def start(self):
+        self.files = FileProcessor()
+
+        self.ai = AIService()
+
+        self.queue = AIQueue(
+            self.ai
+        )
+
+        # user_id -> active task
+        self.active_tasks: dict[
+            int,
+            asyncio.Task,
+        ] = {}
+
+        # user_id -> stop event
+        self.stop_events: dict[
+            int,
+            asyncio.Event,
+        ] = {}
+
+        self.broadcast_lock = asyncio.Lock()
+
+        self.register_handlers()
+
+    # ========================================================
+    # START
+    # ========================================================
+
+    async def start(
+        self,
+    ) -> None:
 
         if not BOT_TOKEN:
+
             raise RuntimeError(
                 "BOT_TOKEN не задан"
             )
 
         if not AI_BASE_URL:
+
             raise RuntimeError(
                 "AI_BASE_URL не задан"
             )
 
         if not AI_API_KEY:
+
             raise RuntimeError(
                 "AI_API_KEY не задан"
             )
 
         if not AI_MODEL_ID:
+
             raise RuntimeError(
                 "AI_MODEL_ID не задан"
             )
 
-        USERS_DIR.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        FILES_DIR.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
         await self.ai.start()
+
         await self.queue.start()
 
         log.info(
-            "Bot started: %s (%s)",
+            "Bot started"
+        )
+
+        log.info(
+            "AI model: %s (%s)",
             AI_MODEL_NAME,
             AI_MODEL_ID,
         )
 
-    async def stop(self):
+        log.info(
+            "Admins: %s",
+            len(ADMIN_IDS),
+        )
 
-        for task in list(
-            self.active_tasks.values()
-        ):
+    # ========================================================
+    # STOP
+    # ========================================================
 
-            task.cancel()
-
-        for task in list(
-            self.active_tasks.values()
-        ):
-
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                pass
-
-        self.active_tasks.clear()
+    async def stop(
+        self,
+    ) -> None:
 
         await self.queue.stop()
+
         await self.ai.close()
 
         await self.bot.session.close()
 
-    # =========================================================================
-    # BUSY USER
-    # =========================================================================
+    # ========================================================
+    # USER
+    # ========================================================
+
+    async def ensure_user(
+        self,
+        message: Message,
+    ) -> Optional[int]:
+
+        if not message.from_user:
+            return None
+
+        user_id = message.from_user.id
+
+        try:
+
+            await self.store.add_user(
+                user_id
+            )
+
+        except Exception:
+
+            log.exception(
+                "Failed to save user %s",
+                user_id,
+            )
+
+        return user_id
+
+    # ========================================================
+    # BUSY
+    # ========================================================
 
     def is_busy(
         self,
@@ -1836,6 +1565,11 @@ class BotApp:
                 None,
             )
 
+            self.stop_events.pop(
+                user_id,
+                None,
+            )
+
             return False
 
         return True
@@ -1848,13 +1582,9 @@ class BotApp:
         if not message.from_user:
             return True
 
-        user_id = (
-            message.from_user.id
-        )
+        user_id = message.from_user.id
 
-        if self.is_busy(
-            user_id
-        ):
+        if self.is_busy(user_id):
 
             await message.answer(
                 "⏳ Я ещё обрабатываю "
@@ -1866,19 +1596,28 @@ class BotApp:
 
         return False
 
+    # ========================================================
+    # TASK REGISTER
+    # ========================================================
+
     def register_task(
         self,
         user_id: int,
         task: asyncio.Task,
-    ):
+        stop_event: asyncio.Event,
+    ) -> None:
 
         self.active_tasks[
             user_id
         ] = task
 
-        def cleanup(
-            finished_task: asyncio.Task,
-        ):
+        self.stop_events[
+            user_id
+        ] = stop_event
+
+        def done_callback(
+            finished: asyncio.Task,
+        ) -> None:
 
             current = (
                 self.active_tasks.get(
@@ -1886,105 +1625,465 @@ class BotApp:
                 )
             )
 
-            if current is finished_task:
+            if current is finished:
 
                 self.active_tasks.pop(
                     user_id,
                     None,
                 )
 
+                self.stop_events.pop(
+                    user_id,
+                    None,
+                )
+
         task.add_done_callback(
-            cleanup
+            done_callback
         )
 
-    # =========================================================================
-    # START
-    # =========================================================================
+    # ========================================================
+    # STOP KEYBOARD
+    # ========================================================
+
+    @staticmethod
+    def stop_keyboard() -> InlineKeyboardMarkup:
+
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="⏹ Стоп",
+                        callback_data="stop_request",
+                    )
+                ]
+            ]
+        )
+
+    # ========================================================
+    # /START
+    # ========================================================
 
     async def handle_start(
         self,
         message: Message,
-    ):
+    ) -> None:
 
-        if not message.from_user:
-            return
-
-        await self.store.get_or_create(
-            message.from_user.id
+        await self.ensure_user(
+            message
         )
 
         await message.answer(
-            "Привет! Я Fable 5👋\n\n"
+            "Привет! 👋\n\n"
+            "Отправь мне сообщение, "
+            "и я помогу с ним.\n\n"
+            "Также можно отправить PDF, "
+            "DOCX, XLSX, PPTX или изображение."
         )
 
-    # =========================================================================
-    # TEXT
-    # =========================================================================
+    # ========================================================
+    # /SEND
+    # ========================================================
+
+    async def handle_send(
+        self,
+        message: Message,
+    ) -> None:
+
+        if not message.from_user:
+
+            return
+
+        user_id = message.from_user.id
+
+        # ----------------------------------------------------
+        # ADMIN CHECK
+        # ----------------------------------------------------
+
+        if user_id not in ADMIN_IDS:
+
+            await message.answer(
+                "⛔ Доступ запрещён."
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # TEXT
+        # ----------------------------------------------------
+
+        text = message.text or ""
+
+        # Убираем команду /send
+        parts = text.split(
+            maxsplit=1
+        )
+
+        if len(parts) < 2:
+
+            await message.answer(
+                "Использование:\n\n"
+                "<code>/send текст рассылки</code>"
+            )
+
+            return
+
+        broadcast_text = parts[1].strip()
+
+        if not broadcast_text:
+
+            await message.answer(
+                "❗ Напиши текст рассылки "
+                "после команды /send."
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # START BROADCAST
+        # ----------------------------------------------------
+
+        task = asyncio.create_task(
+            self.broadcast(
+                admin_message=message,
+                text=broadcast_text,
+            )
+        )
+
+        # Не ждём рассылку внутри Telegram handler.
+        # Она работает отдельно.
+        task.add_done_callback(
+            self.broadcast_task_done
+        )
+
+    # ========================================================
+    # BROADCAST TASK CALLBACK
+    # ========================================================
+
+    @staticmethod
+    def broadcast_task_done(
+        task: asyncio.Task,
+    ) -> None:
+
+        try:
+
+            task.result()
+
+        except asyncio.CancelledError:
+
+            pass
+
+        except Exception:
+
+            log.exception(
+                "Broadcast task failed"
+            )
+
+    # ========================================================
+    # BROADCAST
+    # ========================================================
+
+    async def broadcast(
+        self,
+        admin_message: Message,
+        text: str,
+    ) -> None:
+
+        async with self.broadcast_lock:
+
+            users = await self.store.get_users()
+
+            total = len(users)
+
+            if total == 0:
+
+                await admin_message.answer(
+                    "📢 Рассылать пока некому."
+                )
+
+                return
+
+            status = await admin_message.answer(
+                "📢 Рассылка запущена.\n\n"
+                f"Получателей: <b>{total}</b>\n"
+                "Отправляю..."
+            )
+
+            semaphore = asyncio.Semaphore(
+                BROADCAST_CONCURRENCY
+            )
+
+            sent = 0
+            failed = 0
+            removed = 0
+
+            counter_lock = asyncio.Lock()
+
+            async def send_one(
+                user_id: int,
+            ) -> None:
+
+                nonlocal sent
+                nonlocal failed
+                nonlocal removed
+
+                async with semaphore:
+
+                    try:
+
+                        await self.bot.send_message(
+                            chat_id=user_id,
+                            text=text,
+                        )
+
+                        async with counter_lock:
+
+                            sent += 1
+
+                    except TelegramForbiddenError:
+
+                        # Пользователь заблокировал бота
+                        await self.store.remove_user(
+                            user_id
+                        )
+
+                        async with counter_lock:
+
+                            failed += 1
+                            removed += 1
+
+                    except TelegramRetryAfter as exc:
+
+                        # Telegram попросил подождать
+                        await asyncio.sleep(
+                            float(
+                                exc.retry_after
+                            )
+                        )
+
+                        try:
+
+                            await self.bot.send_message(
+                                chat_id=user_id,
+                                text=text,
+                            )
+
+                            async with counter_lock:
+
+                                sent += 1
+
+                        except TelegramForbiddenError:
+
+                            await self.store.remove_user(
+                                user_id
+                            )
+
+                            async with counter_lock:
+
+                                failed += 1
+                                removed += 1
+
+                        except Exception:
+
+                            async with counter_lock:
+
+                                failed += 1
+
+                    except TelegramNetworkError:
+
+                        async with counter_lock:
+
+                            failed += 1
+
+                    except TelegramBadRequest:
+
+                        async with counter_lock:
+
+                            failed += 1
+
+                    except Exception:
+
+                        log.exception(
+                            "Broadcast failed for %s",
+                            user_id,
+                        )
+
+                        async with counter_lock:
+
+                            failed += 1
+
+                    await asyncio.sleep(
+                        BROADCAST_DELAY
+                    )
+
+            # ------------------------------------------------
+            # SEND IN BATCHES
+            # ------------------------------------------------
+
+            batch_size = (
+                BROADCAST_CONCURRENCY * 10
+            )
+
+            for start in range(
+                0,
+                total,
+                batch_size,
+            ):
+
+                batch = users[
+                    start:
+                    start + batch_size
+                ]
+
+                await asyncio.gather(
+                    *(
+                        send_one(
+                            user_id
+                        )
+                        for user_id in batch
+                    )
+                )
+
+            # ------------------------------------------------
+            # RESULT
+            # ------------------------------------------------
+
+            try:
+
+                await status.edit_text(
+                    "📢 <b>Рассылка завершена.</b>\n\n"
+                    f"👥 Получателей: {total}\n"
+                    f"✅ Доставлено: {sent}\n"
+                    f"❌ Ошибок: {failed}\n"
+                    f"🗑 Удалено из списка: {removed}"
+                )
+
+            except Exception:
+
+                log.exception(
+                    "Failed to edit broadcast status"
+                )
+
+    # ========================================================
+    # STOP CALLBACK
+    # ========================================================
+
+    async def handle_stop(
+        self,
+        callback: CallbackQuery,
+    ) -> None:
+
+        if not callback.from_user:
+
+            await callback.answer()
+
+            return
+
+        user_id = callback.from_user.id
+
+        task = self.active_tasks.get(
+            user_id
+        )
+
+        if not task or task.done():
+
+            await callback.answer(
+                "Запрос уже завершён.",
+                show_alert=False,
+            )
+
+            return
+
+        stop_event = self.stop_events.get(
+            user_id
+        )
+
+        if stop_event:
+
+            stop_event.set()
+
+        task.cancel()
+
+        await callback.answer(
+            "⏹ Остановлено.",
+            show_alert=False,
+        )
+
+        try:
+
+            if callback.message:
+
+                await callback.message.edit_text(
+                    "⏹ Запрос остановлен."
+                )
+
+        except Exception:
+            pass
+
+    # ========================================================
+    # TEXT MESSAGE
+    # ========================================================
 
     async def handle_text(
         self,
         message: Message,
-    ):
+    ) -> None:
 
-        if (
-            not message.from_user
-            or not message.text
+        if not message.from_user:
+            return
+
+        # /send должен обрабатываться
+        # отдельным handler.
+        if message.text and message.text.startswith(
+            "/send"
         ):
             return
+
+        await self.ensure_user(
+            message
+        )
 
         if await self.reject_if_busy(
             message
         ):
             return
 
-        user_id = (
-            message.from_user.id
-        )
+        text = (
+            message.text or ""
+        ).strip()
+
+        if not text:
+            return
 
         task = asyncio.create_task(
-            self.enqueue_text(
-                message
+            self.process_request(
+                message=message,
+                user_text=text,
+                file_context=None,
+                image_data_url=None,
             )
         )
 
         self.register_task(
-            user_id,
+            message.from_user.id,
             task,
+            asyncio.Event(),
         )
 
-    async def enqueue_text(
-        self,
-        message: Message,
-    ):
-
-        user_id = (
-            message.from_user.id
-        )
-
-        await self.queue.put(
-            user_id,
-            {
-                "message": message,
-                "text": message.text or "",
-                "file_context": "",
-                "image_data_url": None,
-            },
-        )
-
-    # =========================================================================
+    # ========================================================
     # DOCUMENT
-    # =========================================================================
+    # ========================================================
 
     async def handle_document(
         self,
         message: Message,
-    ):
+    ) -> None:
 
-        if (
-            not message.from_user
-            or not message.document
-        ):
+        if not message.from_user:
             return
+
+        await self.ensure_user(
+            message
+        )
 
         if await self.reject_if_busy(
             message
@@ -1992,6 +2091,9 @@ class BotApp:
             return
 
         document = message.document
+
+        if not document:
+            return
 
         filename = (
             document.file_name
@@ -2003,10 +2105,9 @@ class BotApp:
             or ""
         )
 
-        # ================================================================
-        # КРИТИЧНО:
-        # ПРОВЕРЯЕМ ТИП ДО СКАЧИВАНИЯ.
-        # ================================================================
+        # ----------------------------------------------------
+        # TYPE CHECK BEFORE DOWNLOAD
+        # ----------------------------------------------------
 
         if not FileProcessor.allowed(
             filename,
@@ -2020,6 +2121,10 @@ class BotApp:
 
             return
 
+        # ----------------------------------------------------
+        # SIZE CHECK BEFORE DOWNLOAD
+        # ----------------------------------------------------
+
         size = (
             document.file_size
             or 0
@@ -2028,91 +2133,92 @@ class BotApp:
         if size > MAX_FILE_SIZE_BYTES:
 
             await message.answer(
-                f"❌ Файл слишком большой. "
+                "❌ Файл слишком большой.\n"
                 f"Максимум — "
                 f"{MAX_FILE_SIZE_MB} МБ."
             )
 
             return
 
-        user_id = (
-            message.from_user.id
-        )
+        # ----------------------------------------------------
+        # CREATE TASK
+        # ----------------------------------------------------
+
+        stop_event = asyncio.Event()
 
         task = asyncio.create_task(
             self.process_document(
-                message,
-                document.file_id,
-                filename,
-                mime,
-                size,
+                message=message,
+                file_id=document.file_id,
+                filename=filename,
+                mime=mime,
             )
         )
 
         self.register_task(
-            user_id,
+            message.from_user.id,
             task,
+            stop_event,
         )
 
-    # =========================================================================
+    # ========================================================
     # PHOTO
-    # =========================================================================
+    # ========================================================
 
     async def handle_photo(
         self,
         message: Message,
-    ):
+    ) -> None:
 
-        if (
-            not message.from_user
-            or not message.photo
-        ):
+        if not message.from_user:
             return
+
+        await self.ensure_user(
+            message
+        )
 
         if await self.reject_if_busy(
             message
         ):
             return
 
+        if not message.photo:
+            return
+
         photo = message.photo[-1]
 
-        size = (
+        if (
             photo.file_size
-            or 0
-        )
-
-        if size > MAX_FILE_SIZE_BYTES:
+            and photo.file_size
+            > MAX_FILE_SIZE_BYTES
+        ):
 
             await message.answer(
-                f"❌ Файл слишком большой. "
+                "❌ Фото слишком большое.\n"
                 f"Максимум — "
                 f"{MAX_FILE_SIZE_MB} МБ."
             )
 
             return
 
-        user_id = (
-            message.from_user.id
-        )
+        stop_event = asyncio.Event()
 
         task = asyncio.create_task(
-            self.process_document(
+            self.process_photo(
                 message,
                 photo.file_id,
-                "photo.jpg",
-                "image/jpeg",
-                size,
             )
         )
 
         self.register_task(
-            user_id,
+            message.from_user.id,
             task,
+            stop_event,
         )
 
-    # =========================================================================
-    # FILE PROCESSING
-    # =========================================================================
+    # ========================================================
+    # PROCESS DOCUMENT
+    # ========================================================
 
     async def process_document(
         self,
@@ -2120,28 +2226,71 @@ class BotApp:
         file_id: str,
         filename: str,
         mime: str,
-        size: int,
-    ):
+    ) -> None:
 
-        user_id = (
-            message.from_user.id
-        )
+        if not message.from_user:
+            return
 
-        path: Optional[Path] = None
+        user_id = message.from_user.id
+
+        status = None
+        path = None
 
         try:
 
-            # ------------------------------------------------------------
-            # СКАЧИВАНИЕ И ОБРАБОТКА ФАЙЛА
-            # НЕ ЗАНИМАЮТ AI WORKER.
-            # ------------------------------------------------------------
-
-            path = await self.files.download(
-                self.bot,
-                file_id,
-                filename,
-                size,
+            status = await message.answer(
+                "📄 Читаю файл…",
+                reply_markup=self.stop_keyboard(),
             )
+
+            # ------------------------------------------------
+            # TELEGRAM FILE
+            # ------------------------------------------------
+
+            telegram_file = await self.bot.get_file(
+                file_id
+            )
+
+            if not telegram_file.file_path:
+
+                raise RuntimeError(
+                    "Telegram не вернул путь файла"
+                )
+
+            safe_name = (
+                re.sub(
+                    r"[^a-zA-Z0-9а-яА-Я._-]",
+                    "_",
+                    filename,
+                )
+                or "file"
+            )
+
+            path = (
+                FILES_DIR
+                / f"{uuid.uuid4().hex}_{safe_name}"
+            )
+
+            await self.bot.download_file(
+                telegram_file.file_path,
+                destination=path,
+            )
+
+            # ------------------------------------------------
+            # PROCESS FILE
+            # ------------------------------------------------
+
+            if status:
+
+                try:
+
+                    await status.edit_text(
+                        "📄 Анализирую файл…",
+                        reply_markup=self.stop_keyboard(),
+                    )
+
+                except Exception:
+                    pass
 
             result = await self.files.process(
                 path,
@@ -2151,1123 +2300,784 @@ class BotApp:
 
             path = None
 
-            caption = (
-                message.caption
-                or ""
-            ).strip()
-
-            # ------------------------------------------------------------
+            # ------------------------------------------------
             # IMAGE
-            # ------------------------------------------------------------
+            # ------------------------------------------------
 
-            if result["kind"] == "image":
+            if result.get("type") == "image":
 
-                user_text = (
-                    caption
-                    or "Проанализируй "
-                    "прикреплённое изображение."
-                )
-
-                await self.queue.put(
-                    user_id,
-                    {
-                        "message": message,
-                        "text": user_text,
-                        "file_context": "",
-                        "image_data_url": (
-                            result["data_url"]
-                        ),
-                    },
+                await self.process_request(
+                    message=message,
+                    user_text=(
+                        message.caption
+                        or "Проанализируй это изображение."
+                    ),
+                    file_context=None,
+                    image_data_url=result.get(
+                        "data_url"
+                    ),
+                    status_message=status,
                 )
 
                 return
 
-            # ------------------------------------------------------------
-            # TEXT FILE
-            # ------------------------------------------------------------
+            # ------------------------------------------------
+            # TEXT
+            # ------------------------------------------------
 
-            text = (
+            file_text = (
                 result.get(
                     "text",
                     "",
                 )
                 or ""
-            ).strip()
+            )
 
-            if not text:
+            if not file_text.strip():
 
                 await message.answer(
-                    "⚠️ В файле не удалось "
-                    "найти читаемый текст."
+                    "❌ Не удалось извлечь "
+                    "текст из файла."
                 )
+
+                if status:
+
+                    try:
+                        await status.delete()
+                    except Exception:
+                        pass
 
                 return
 
             user_text = (
-                caption
-                or "Проанализируй "
-                "прикреплённый файл."
+                message.caption
+                or "Проанализируй содержимое этого файла."
             )
 
-            await self.queue.put(
-                user_id,
-                {
-                    "message": message,
-                    "text": user_text,
-                    "file_context": (
-                        f"Файл: {filename}\n\n"
-                        f"{text}"
-                    ),
-                    "image_data_url": None,
-                },
+            file_context = (
+                f"\n\n"
+                f"--- Файл: {filename} ---\n"
+                f"{file_text}\n"
+                f"--- Конец файла ---"
+            )
+
+            await self.process_request(
+                message=message,
+                user_text=user_text,
+                file_context=file_context,
+                image_data_url=None,
+                status_message=status,
             )
 
         except asyncio.CancelledError:
 
-            if path:
-                path.unlink(
-                    missing_ok=True
-                )
+            try:
+
+                if status:
+                    await status.delete()
+
+            except Exception:
+                pass
 
             raise
 
-        except FileTooLarge:
+        except Exception as exc:
 
-            if path:
-                path.unlink(
-                    missing_ok=True
-                )
-
-            await message.answer(
-                f"❌ Файл слишком большой. "
-                f"Максимум — "
-                f"{MAX_FILE_SIZE_MB} МБ."
+            log.exception(
+                "Document processing failed"
             )
 
-        except UnsupportedFile:
+            try:
 
-            if path:
-                path.unlink(
-                    missing_ok=True
-                )
+                if status:
+                    await status.delete()
+
+            except Exception:
+                pass
 
             await message.answer(
-                "❌ Этот тип файла "
-                "пока не поддерживается."
+                "❌ Не удалось обработать файл."
             )
+
+        finally:
+
+            if path:
+
+                try:
+
+                    path.unlink(
+                        missing_ok=True
+                    )
+
+                except Exception:
+                    pass
+
+    # ========================================================
+    # PROCESS PHOTO
+    # ========================================================
+
+    async def process_photo(
+        self,
+        message: Message,
+        file_id: str,
+    ) -> None:
+
+        status = None
+        path = None
+
+        try:
+
+            status = await message.answer(
+                "👀 Смотрю фото…",
+                reply_markup=self.stop_keyboard(),
+            )
+
+            telegram_file = await self.bot.get_file(
+                file_id
+            )
+
+            if not telegram_file.file_path:
+
+                raise RuntimeError(
+                    "Telegram не вернул путь изображения"
+                )
+
+            path = (
+                FILES_DIR
+                / f"{uuid.uuid4().hex}.jpg"
+            )
+
+            await self.bot.download_file(
+                telegram_file.file_path,
+                destination=path,
+            )
+
+            raw = path.read_bytes()
+
+            encoded = base64.b64encode(
+                raw
+            ).decode(
+                "ascii"
+            )
+
+            data_url = (
+                "data:image/jpeg;base64,"
+                + encoded
+            )
+
+            await self.process_request(
+                message=message,
+                user_text=(
+                    message.caption
+                    or "Проанализируй это изображение."
+                ),
+                file_context=None,
+                image_data_url=data_url,
+                status_message=status,
+            )
+
+        except asyncio.CancelledError:
+
+            try:
+
+                if status:
+                    await status.delete()
+
+            except Exception:
+                pass
+
+            raise
 
         except Exception:
 
-            if path:
-                path.unlink(
-                    missing_ok=True
-                )
-
             log.exception(
-                "Ошибка обработки файла "
-                "для пользователя %s",
-                user_id,
+                "Photo processing failed"
             )
+
+            try:
+
+                if status:
+                    await status.delete()
+
+            except Exception:
+                pass
 
             await message.answer(
-                "❌ Не удалось обработать "
-                "файл. Попробуйте другой."
+                "❌ Не удалось обработать изображение."
             )
 
-    # =========================================================================
-    # UNSUPPORTED
-    # =========================================================================
+        finally:
+
+            if path:
+
+                try:
+
+                    path.unlink(
+                        missing_ok=True
+                    )
+
+                except Exception:
+                    pass
+
+    # ========================================================
+    # UNSUPPORTED MEDIA
+    # ========================================================
 
     async def handle_unsupported_media(
         self,
         message: Message,
-    ):
+    ) -> None:
 
-        # НИЧЕГО НЕ СКАЧИВАЕМ.
-        # Сразу отвечаем пользователю.
+        if message.from_user:
+
+            await self.ensure_user(
+                message
+            )
 
         await message.answer(
             "❌ Этот тип файла "
             "пока не поддерживается."
         )
 
-    # =========================================================================
-    # AI JOB
-    # =========================================================================
+    # ========================================================
+    # MAIN AI PROCESS
+    # ========================================================
 
-    async def run_ai_job(
+    async def process_request(
         self,
-        user_id: int,
-        payload: dict[str, Any],
-    ):
+        message: Message,
+        user_text: str,
+        file_context: Optional[str],
+        image_data_url: Optional[str],
+        status_message: Optional[Message] = None,
+    ) -> None:
 
-        message: Message = (
-            payload["message"]
-        )
-
-        text: str = (
-            payload["text"]
-        )
-
-        file_context: str = (
-            payload.get(
-                "file_context",
-                "",
-            )
-            or ""
-        )
-
-        image_data_url = payload.get(
-            "image_data_url"
-        )
-
-        allowed, reset_at = (
-            await self.limits.allowed(
-                user_id
-            )
-        )
-
-        if not allowed:
-
-            await self.send_limit_message(
-                message,
-                reset_at,
-            )
-
+        if not message.from_user:
             return
 
-        keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="⏹ Стоп",
-                        callback_data=(
-                            "stop_request"
-                        ),
-                    )
-                ]
-            ]
-        )
+        user_id = message.from_user.id
 
-        status_message: Optional[
-            Message
-        ] = None
+        status = status_message
 
         try:
 
-            status_message = (
-                await message.answer(
-                    "🧠 Думаю...",
-                    reply_markup=keyboard,
+            # ------------------------------------------------
+            # STATUS
+            # ------------------------------------------------
+
+            if status is None:
+
+                status = await message.answer(
+                    "🧠 Думаю…",
+                    reply_markup=self.stop_keyboard(),
+                )
+
+            else:
+
+                try:
+
+                    await status.edit_text(
+                        "🧠 Думаю…",
+                        reply_markup=self.stop_keyboard(),
+                    )
+
+                except Exception:
+                    pass
+
+            # ------------------------------------------------
+            # HISTORY
+            # ------------------------------------------------
+
+            history = await self.store.get_history(
+                user_id
+            )
+
+            # ------------------------------------------------
+            # COMPRESS OLD HISTORY
+            # ------------------------------------------------
+
+            history = await self.maybe_compress_history(
+                user_id,
+                history,
+            )
+
+            # ------------------------------------------------
+            # USER MESSAGE
+            # ------------------------------------------------
+
+            if file_context:
+
+                user_content = (
+                    user_text
+                    + file_context
+                )
+
+            else:
+
+                user_content = user_text
+
+            # ------------------------------------------------
+            # HIDDEN PLAN
+            # ------------------------------------------------
+
+            plan_messages: list[
+                dict[str, Any]
+            ] = [
+                {
+                    "role": "system",
+                    "content": (
+                        self.ai.get_system_prompt()
+                        + "\n\n"
+                        "Перед основным ответом "
+                        "сделай краткий внутренний "
+                        "план решения. "
+                        "Этот план не показывай пользователю."
+                    ),
+                }
+            ]
+
+            # Добавляем историю,
+            # но только ограниченный объём.
+            plan_messages.extend(
+                self.prepare_history_for_ai(
+                    history
                 )
             )
 
-            state = (
-                await self.store.get_or_create(
-                    user_id
+            plan_messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Сначала составь краткий "
+                        "внутренний план решения "
+                        "следующего запроса. "
+                        "Не отвечай пользователю "
+                        "и не показывай план.\n\n"
+                        + user_content
+                    ),
+                }
+            )
+
+            # ------------------------------------------------
+            # PLAN REQUEST
+            # ------------------------------------------------
+
+            plan = await self.ai.request(
+                plan_messages,
+                temperature=0.2,
+            )
+
+            # ------------------------------------------------
+            # MAIN REQUEST
+            # ------------------------------------------------
+
+            main_messages: list[
+                dict[str, Any]
+            ] = [
+                {
+                    "role": "system",
+                    "content":
+                        self.ai.get_system_prompt(),
+                }
+            ]
+
+            main_messages.extend(
+                self.prepare_history_for_ai(
+                    history
                 )
             )
 
-            history = list(
-                state.get(
-                    "history",
-                    [],
+            # ------------------------------------------------
+            # MULTIMODAL
+            # ------------------------------------------------
+
+            if image_data_url:
+
+                content = [
+                    {
+                        "type": "text",
+                        "text": (
+                            "Внутренний план:\n"
+                            + plan
+                            + "\n\n"
+                            "Запрос пользователя:\n"
+                            + user_text
+                        ),
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url":
+                                image_data_url,
+                        },
+                    },
+                ]
+
+                main_messages.append(
+                    {
+                        "role": "user",
+                        "content": content,
+                    }
                 )
+
+            else:
+
+                main_messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Внутренний план "
+                            "(не показывай его):\n"
+                            + plan
+                            + "\n\n"
+                            "Теперь дай пользователю "
+                            "итоговый ответ.\n\n"
+                            + user_content
+                        ),
+                    }
+                )
+
+            # ------------------------------------------------
+            # AI
+            # ------------------------------------------------
+
+            answer = await self.ai.request(
+                main_messages,
+                temperature=0.7,
             )
 
-            if MAX_HISTORY_MESSAGES > 0:
+            if not answer:
+
+                answer = (
+                    "Не удалось получить ответ."
+                )
+
+            # ------------------------------------------------
+            # SAVE HISTORY
+            # ------------------------------------------------
+
+            history.append(
+                {
+                    "role": "user",
+                    "content": user_content,
+                }
+            )
+
+            history.append(
+                {
+                    "role": "assistant",
+                    "content": answer,
+                }
+            )
+
+            # Ограничиваем количество сообщений
+            if len(history) > MAX_HISTORY_MESSAGES:
 
                 history = history[
                     -MAX_HISTORY_MESSAGES:
                 ]
 
-            # ========================================================
-            # HIDDEN PLAN
-            # ========================================================
-
-            plan, plan_data = (
-                await self.ai.hidden_plan(
-                    history,
-                    text,
-                    file_context,
-                )
-            )
-
-            plan_in, plan_out = (
-                extract_usage(
-                    plan_data
-                )
-            )
-
-            # ========================================================
-            # MAIN ANSWER
-            # ========================================================
-
-            answer, answer_data = (
-                await self.ai.answer(
-                    history,
-                    text,
-                    plan,
-                    file_context,
-                    image_data_url,
-                )
-            )
-
-            answer_in, answer_out = (
-                extract_usage(
-                    answer_data
-                )
-            )
-
-            total_tokens = (
-                plan_in
-                + plan_out
-                + answer_in
-                + answer_out
-            )
-
-            if total_tokens <= 0:
-
-                total_tokens = (
-                    estimate_tokens(text)
-                    + estimate_tokens(plan)
-                    + estimate_tokens(answer)
-                    + estimate_tokens(file_context)
-                )
-
-            await self.limits.add_tokens(
+            await self.store.save_history(
                 user_id,
-                total_tokens,
+                history,
             )
 
-            # ========================================================
-            # HISTORY
-            # ========================================================
+            # ------------------------------------------------
+            # REMOVE STATUS
+            # ------------------------------------------------
 
-            history_user_text = text
-
-            if file_context:
-
-                history_user_text += (
-                    "\n\n"
-                    "[Прикреплённый файл]\n"
-                    + file_context
-                )
-
-            if image_data_url:
-
-                history_user_text += (
-                    "\n\n"
-                    "[Изображение прикреплено]"
-                )
-
-            history.append({
-                "role": "user",
-                "content": truncate_text(
-                    history_user_text,
-                    80_000,
-                ),
-            })
-
-            history.append({
-                "role": "assistant",
-                "content": answer,
-            })
-
-            state["history"] = history
-
-            await self.store.save(
-                user_id,
-                state,
-            )
-
-            # ========================================================
-            # COMPRESS
-            # ========================================================
-
-            await self.maybe_compress_history(
-                user_id
-            )
-
-            # ========================================================
-            # DELETE "THINKING..."
-            # ========================================================
-
-            if status_message:
+            if status:
 
                 try:
 
-                    await status_message.delete()
+                    await status.delete()
 
                 except Exception:
                     pass
 
+            # ------------------------------------------------
+            # SEND ANSWER
+            # ------------------------------------------------
+
             await self.send_long_message(
                 message,
-                answer
-                or "Не удалось получить ответ.",
+                answer,
             )
 
         except asyncio.CancelledError:
 
-            if status_message:
+            if status:
 
                 try:
 
-                    await status_message.edit_text(
-                        "⏹ Обработка остановлена."
-                    )
+                    await status.delete()
 
                 except Exception:
                     pass
 
-            raise
-
-        except AIError as exc:
-
-            log.error(
-                "AI error user=%s: %s",
-                user_id,
-                exc,
-            )
-
-            if status_message:
-
-                try:
-
-                    await status_message.edit_text(
-                        "❌ Не удалось получить "
-                        "ответ от AI. "
-                        "Попробуйте ещё раз."
-                    )
-
-                except Exception:
-
-                    await message.answer(
-                        "❌ Не удалось получить "
-                        "ответ от AI."
-                    )
-
-            else:
+            try:
 
                 await message.answer(
-                    "❌ Не удалось получить "
-                    "ответ от AI."
+                    "⏹ Запрос остановлен."
                 )
+
+            except Exception:
+                pass
+
+            raise
 
         except Exception:
 
             log.exception(
-                "Unexpected AI error "
-                "user=%s",
+                "Request processing failed "
+                "for user %s",
                 user_id,
             )
 
-            if status_message:
+            if status:
 
                 try:
 
-                    await status_message.edit_text(
-                        "❌ Произошла ошибка "
-                        "при обработке."
-                    )
+                    await status.delete()
 
                 except Exception:
                     pass
 
-            else:
+            await message.answer(
+                "❌ Не удалось обработать запрос. "
+                "Попробуйте ещё раз."
+            )
 
-                await message.answer(
-                    "❌ Произошла ошибка "
-                    "при обработке."
-                )
+    # ========================================================
+    # HISTORY PREPARE
+    # ========================================================
 
-    # =========================================================================
+    @staticmethod
+    def prepare_history_for_ai(
+        history: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+
+        result = []
+
+        for item in history:
+
+            role = item.get(
+                "role"
+            )
+
+            content = item.get(
+                "content"
+            )
+
+            if role not in {
+                "user",
+                "assistant",
+            }:
+                continue
+
+            if not isinstance(
+                content,
+                str,
+            ):
+                continue
+
+            result.append(
+                {
+                    "role": role,
+                    "content": content,
+                }
+            )
+
+        return result
+
+    # ========================================================
     # HISTORY COMPRESSION
-    # =========================================================================
+    # ========================================================
 
     async def maybe_compress_history(
         self,
         user_id: int,
-    ):
-
-        state = (
-            await self.store.get_or_create(
-                user_id
-            )
-        )
-
-        history = list(
-            state.get(
-                "history",
-                [],
-            )
-        )
+        history: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
 
         if not history:
-            return
+            return history
 
-        total_words = 0
-
-        for item in history:
-
-            content = item.get(
-                "content",
-                "",
-            )
-
-            if isinstance(
-                content,
-                str,
-            ):
-
-                total_words += word_count(
-                    content
+        full_text = "\n".join(
+            str(
+                item.get(
+                    "content",
+                    "",
                 )
+            )
+            for item in history
+        )
 
-        if total_words < HISTORY_COMPRESS_WORDS:
-            return
+        words = count_words(
+            full_text
+        )
 
-        keep_count = max(
-            6,
-            MAX_HISTORY_MESSAGES // 3,
+        if words < HISTORY_COMPRESS_WORDS:
+
+            return history
+
+        log.info(
+            "Compressing history for %s "
+            "(%s words)",
+            user_id,
+            words,
+        )
+
+        # Берём старую часть истории
+        # для сжатия.
+        split_at = max(
+            2,
+            len(history) // 2,
         )
 
         old_history = history[
-            :-keep_count
+            :split_at
         ]
 
-        recent_history = history[
-            -keep_count:
+        new_history = history[
+            split_at:
         ]
 
-        if not old_history:
-            return
+        old_text = "\n\n".join(
+            (
+                f"{item.get('role', '')}: "
+                f"{item.get('content', '')}"
+            )
+            for item in old_history
+        )
+
+        summary_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Сделай компактное резюме "
+                    "старой истории диалога. "
+                    "Сохрани важные факты, "
+                    "решения, предпочтения, "
+                    "незавершённые задачи "
+                    "и контекст, необходимый "
+                    "для продолжения разговора. "
+                    "Не добавляй выдуманных фактов."
+                ),
+            },
+            {
+                "role": "user",
+                "content": old_text,
+            },
+        ]
 
         try:
 
-            summary, data = (
-                await self.ai.compress_history(
-                    old_history,
-                    state.get(
-                        "compressed_summary",
-                        "",
+            summary = await self.ai.request(
+                summary_messages,
+                temperature=0.2,
+            )
+
+            compressed = [
+                {
+                    "role": "assistant",
+                    "content": (
+                        "[Краткое резюме "
+                        "предыдущей части диалога]\n"
+                        + summary
                     ),
-                )
+                }
+            ]
+
+            result = (
+                compressed
+                + new_history
             )
 
-            if not summary:
-                return
-
-            input_tokens, output_tokens = (
-                extract_usage(data)
-            )
-
-            await self.limits.add_tokens(
+            await self.store.save_history(
                 user_id,
-                input_tokens
-                + output_tokens,
+                result,
             )
 
-            state = (
-                await self.store.get_or_create(
-                    user_id
-                )
-            )
-
-            state[
-                "compressed_summary"
-            ] = truncate_text(
-                summary,
-                40_000,
-            )
-
-            state["history"] = (
-                recent_history
-            )
-
-            await self.store.save(
-                user_id,
-                state,
-            )
+            return result
 
         except Exception:
 
-            # Сжатие НЕ должно ломать чат.
             log.exception(
-                "Ошибка сжатия истории "
-                "user=%s",
+                "History compression failed "
+                "for user %s",
                 user_id,
             )
 
-    # =========================================================================
-    # STOP
-    # =========================================================================
-
-    async def handle_stop_command(
-        self,
-        message: Message,
-    ):
-
-        if not message.from_user:
-            return
-
-        user_id = (
-            message.from_user.id
-        )
-
-        task = (
-            self.active_tasks.get(
-                user_id
-            )
-        )
-
-        if not task or task.done():
-
-            await message.answer(
-                "Сейчас нечего останавливать 🙂"
-            )
-
-            return
-
-        task.cancel()
-
-    async def handle_callback(
-        self,
-        callback: CallbackQuery,
-    ):
-
-        if callback.data != "stop_request":
-
-            await callback.answer()
-
-            return
-
-        user_id = (
-            callback.from_user.id
-        )
-
-        task = (
-            self.active_tasks.get(
-                user_id
-            )
-        )
-
-        if not task or task.done():
-
-            await callback.answer(
-                "Обработка уже завершена."
-            )
-
-            return
-
-        task.cancel()
-
-        await callback.answer(
-            "Останавливаю…"
-        )
-
-    # =========================================================================
-    # LIMIT
-    # =========================================================================
-
-    async def send_limit_message(
-        self,
-        message: Message,
-        reset_at: int,
-    ):
-
-        if reset_at:
-
-            remaining = max(
-                0,
-                reset_at
-                - int(now_ts()),
-            )
-
-            reset_text = (
-                format_seconds(
-                    remaining
-                )
-            )
-
-        else:
-
-            reset_text = "позже"
-
-        await message.answer(
-            "⏳ Лимит временно исчерпан.\n\n"
-            f"Он обновится через "
-            f"{reset_text}.\n"
-            f"Если нужна подписка — "
-            f"напишите администратору "
-            f"{PURCHASE_USERNAME}."
-        )
-
-    # =========================================================================
-    # ADMIN
-    # =========================================================================
-
-    def is_admin(
-        self,
-        user_id: int,
-    ) -> bool:
-
-        return user_id in ADMIN_IDS
-
-    async def handle_admin_command(
-        self,
-        message: Message,
-    ):
-
-        if not message.from_user:
-            return
-
-        if not self.is_admin(
-            message.from_user.id
-        ):
-
-            await message.answer(
-                "⛔ Доступ запрещён."
-            )
-
-            return
-
-        text = (
-            message.text
-            or ""
-        ).strip()
-
-        parts = text.split(
-            maxsplit=2
-        )
-
-        command = (
-            parts[0]
-            .split("@")[0]
-            .lower()
-        )
-
-        # ------------------------------------------------------------
-        # /admin
-        # ------------------------------------------------------------
-
-        if command == "/admin":
-
-            await self.show_admin(
-                message
-            )
-
-            return
-
-        # ------------------------------------------------------------
-        # /give_subscription
-        # /set_subscription
-        # ------------------------------------------------------------
-
-        if command in {
-            "/give_subscription",
-            "/set_subscription",
-        }:
-
-            if len(parts) < 3:
-
-                await message.answer(
-                    "Использование:\n"
-                    "/give_subscription USER_ID HOURS\n"
-                    "/set_subscription USER_ID HOURS"
-                )
-
-                return
-
-            try:
-
-                target_id = int(
-                    parts[1]
-                )
-
-                hours = float(
-                    parts[2].replace(
-                        ",",
-                        ".",
-                    )
-                )
-
-            except ValueError:
-
-                await message.answer(
-                    "❌ Неверный ID "
-                    "или количество часов."
-                )
-
-                return
-
-            if hours <= 0:
-
-                await message.answer(
-                    "❌ Количество часов "
-                    "должно быть больше нуля."
-                )
-
-                return
-
-            state = (
-                await self.store.get_or_create(
-                    target_id
-                )
-            )
-
-            if command == (
-                "/give_subscription"
-            ):
-
-                current = max(
-                    now_ts(),
-                    float(
-                        state.get(
-                            "subscription_until",
-                            0,
-                        )
-                    ),
-                )
-
-                state[
-                    "subscription_until"
-                ] = (
-                    current
-                    + hours * 3600
-                )
-
-            else:
-
-                state[
-                    "subscription_until"
-                ] = (
-                    now_ts()
-                    + hours * 3600
-                )
-
-            await self.store.save(
-                target_id,
-                state,
-            )
-
-            await message.answer(
-                f"✅ Подписка пользователя "
-                f"<code>{target_id}</code> "
-                f"изменена.\n\n"
-                f"До: <b>"
-                f"{time.strftime('%d.%m.%Y %H:%M', time.localtime(state['subscription_until']))}"
-                f"</b>"
-            )
-
-            return
-
-        # ------------------------------------------------------------
-        # /delete_subscription
-        # ------------------------------------------------------------
-
-        if command == (
-            "/delete_subscription"
-        ):
-
-            if len(parts) < 2:
-
-                await message.answer(
-                    "Использование:\n"
-                    "/delete_subscription USER_ID"
-                )
-
-                return
-
-            try:
-
-                target_id = int(
-                    parts[1]
-                )
-
-            except ValueError:
-
-                await message.answer(
-                    "❌ Неверный ID."
-                )
-
-                return
-
-            state = (
-                await self.store.get_or_create(
-                    target_id
-                )
-            )
-
-            state[
-                "subscription_until"
-            ] = 0
-
-            await self.store.save(
-                target_id,
-                state,
-            )
-
-            await message.answer(
-                f"✅ Подписка пользователя "
-                f"<code>{target_id}</code> "
-                f"удалена."
-            )
-
-            return
-
-        # ------------------------------------------------------------
-        # /subscription
-        # ------------------------------------------------------------
-
-        if command == "/subscription":
-
-            if len(parts) < 2:
-
-                await message.answer(
-                    "Использование:\n"
-                    "/subscription USER_ID"
-                )
-
-                return
-
-            try:
-
-                target_id = int(
-                    parts[1]
-                )
-
-            except ValueError:
-
-                await message.answer(
-                    "❌ Неверный ID."
-                )
-
-                return
-
-            await message.answer(
-                await self.subscription_info(
-                    target_id
-                )
-            )
-
-            return
-
-        # ------------------------------------------------------------
-        # /broadcast
-        # ------------------------------------------------------------
-
-        if command == "/broadcast":
-
-            if len(parts) < 2:
-
-                await message.answer(
-                    "Использование:\n"
-                    "/broadcast ТЕКСТ"
-                )
-
-                return
-
-            broadcast_text = (
-                text.split(
-                    maxsplit=1
-                )[1].strip()
-            )
-
-            await self.broadcast(
-                message,
-                broadcast_text,
-            )
-
-    async def show_admin(
-        self,
-        message: Message,
-    ):
-
-        keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="➕ Выдать / изменить",
-                        callback_data=(
-                            "admin_sub"
-                        ),
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        text="🗑 Удалить подписку",
-                        callback_data=(
-                            "admin_delete"
-                        ),
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        text="ℹ️ Информация",
-                        callback_data=(
-                            "admin_info"
-                        ),
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        text="📢 Рассылка",
-                        callback_data=(
-                            "admin_broadcast"
-                        ),
-                    )
-                ],
-            ]
-        )
-
-        await message.answer(
-            "👑 <b>Админ-панель</b>\n\n"
-            "Команды:\n\n"
-            "<code>/give_subscription USER_ID HOURS</code>\n"
-            "<code>/set_subscription USER_ID HOURS</code>\n"
-            "<code>/delete_subscription USER_ID</code>\n"
-            "<code>/subscription USER_ID</code>\n"
-            "<code>/broadcast ТЕКСТ</code>",
-            reply_markup=keyboard,
-        )
-
-    async def subscription_info(
-        self,
-        user_id: int,
-    ) -> str:
-
-        state = (
-            await self.store.get_or_create(
-                user_id
-            )
-        )
-
-        until = float(
-            state.get(
-                "subscription_until",
-                0,
-            )
-        )
-
-        if until > now_ts():
-
-            subscription = time.strftime(
-                "%d.%m.%Y %H:%M",
-                time.localtime(
-                    until
-                ),
-            )
-
-        else:
-
-            subscription = "нет"
-
-        return (
-            f"👤 ID: <code>{user_id}</code>\n"
-            f"💎 Подписка до: "
-            f"<b>{subscription}</b>\n"
-            f"🪙 Использовано токенов: "
-            f"<b>{int(state.get('used_tokens', 0))}</b>"
-        )
-
-    async def broadcast(
-        self,
-        admin_message: Message,
-        text: str,
-    ):
-
-        user_ids = (
-            await self.store.all_user_ids()
-        )
-
-        if not user_ids:
-
-            await admin_message.answer(
-                "📢 Пользователей пока нет."
-            )
-
-            return
-
-        sent = 0
-        failed = 0
-
-        for user_id in user_ids:
-
-            try:
-
-                await self.bot.send_message(
-                    user_id,
-                    text,
-                )
-
-                sent += 1
-
-            except Exception:
-
-                failed += 1
-
-            await asyncio.sleep(
-                0.05
-            )
-
-        await admin_message.answer(
-            f"📢 Рассылка завершена.\n"
-            f"Отправлено: {sent}\n"
-            f"Ошибок: {failed}"
-        )
-
-    # =========================================================================
+            # Если сжатие не удалось,
+            # просто оставляем историю.
+            return history
+
+    # ========================================================
     # SEND LONG MESSAGE
-    # =========================================================================
+    # ========================================================
 
     async def send_long_message(
         self,
         message: Message,
         text: str,
-    ):
+    ) -> None:
 
-        text = (
-            text
-            or "Пустой ответ."
-        )
+        # Telegram ограничивает размер сообщения.
+        max_length = 4000
 
-        limit = 3900
+        if len(text) <= max_length:
+
+            try:
+
+                await message.answer(
+                    text
+                )
+
+            except TelegramBadRequest:
+
+                # Если AI выдал некорректный HTML,
+                # отправляем обычным текстом.
+                await message.answer(
+                    self.strip_html(
+                        text
+                    )
+                )
+
+            return
+
+        # ----------------------------------------------------
+        # SPLIT
+        # ----------------------------------------------------
 
         chunks = []
 
-        while len(text) > limit:
+        current = ""
 
-            split_at = text.rfind(
-                "\n",
-                0,
-                limit,
-            )
+        for line in text.splitlines(
+            keepends=True
+        ):
 
-            if split_at < limit // 2:
+            if (
+                len(current)
+                + len(line)
+                > max_length
+            ):
 
-                split_at = text.rfind(
-                    " ",
-                    0,
-                    limit,
-                )
+                if current:
+                    chunks.append(
+                        current
+                    )
 
-            if split_at < limit // 2:
+                current = line
 
-                split_at = limit
+            else:
 
+                current += line
+
+        if current:
             chunks.append(
-                text[:split_at]
-            )
-
-            text = text[
-                split_at:
-            ].lstrip()
-
-        if text:
-            chunks.append(
-                text
+                current
             )
 
         for chunk in chunks:
@@ -3278,51 +3088,176 @@ class BotApp:
                     chunk
                 )
 
-            except Exception:
-
-                # Если модель прислала
-                # некорректный HTML.
-                plain = re.sub(
-                    r"<[^>]+>",
-                    "",
-                    chunk,
-                )
+            except TelegramBadRequest:
 
                 await message.answer(
-                    plain
+                    self.strip_html(
+                        chunk
+                    )
                 )
 
+            await asyncio.sleep(
+                0.05
+            )
 
-# ============================================================================
-# ALIAS ДЛЯ render_start.py
-# ============================================================================
+    # ========================================================
+    # STRIP HTML
+    # ========================================================
+
+    @staticmethod
+    def strip_html(
+        text: str,
+    ) -> str:
+
+        return re.sub(
+            r"<[^>]+>",
+            "",
+            text,
+        )
+
+    # ========================================================
+    # CATCH ALL
+    # ========================================================
+
+    async def handle_unknown(
+        self,
+        message: Message,
+    ) -> None:
+
+        if message.from_user:
+
+            await self.ensure_user(
+                message
+            )
+
+        await message.answer(
+            "❌ Этот тип сообщения "
+            "пока не поддерживается."
+        )
+
+    # ========================================================
+    # REGISTER HANDLERS
+    # ========================================================
+
+    def register_handlers(
+        self,
+    ) -> None:
+
+        # ----------------------------------------------------
+        # START
+        # ----------------------------------------------------
+
+        self.router.message.register(
+            self.handle_start,
+            CommandStart(),
+        )
+
+        # ----------------------------------------------------
+        # SEND
+        # ----------------------------------------------------
+
+        self.router.message.register(
+            self.handle_send,
+            Command("send"),
+        )
+
+        # ----------------------------------------------------
+        # STOP
+        # ----------------------------------------------------
+
+        self.router.callback_query.register(
+            self.handle_stop,
+            F.data == "stop_request",
+        )
+
+        # ----------------------------------------------------
+        # DOCUMENT
+        # ----------------------------------------------------
+
+        self.router.message.register(
+            self.handle_document,
+            F.document,
+        )
+
+        # ----------------------------------------------------
+        # PHOTO
+        # ----------------------------------------------------
+
+        self.router.message.register(
+            self.handle_photo,
+            F.photo,
+        )
+
+        # ----------------------------------------------------
+        # UNSUPPORTED MEDIA
+        # ----------------------------------------------------
+
+        self.router.message.register(
+            self.handle_unsupported_media,
+            F.video
+            | F.animation
+            | F.audio
+            | F.voice
+            | F.video_note,
+        )
+
+        # ----------------------------------------------------
+        # TEXT
+        # ----------------------------------------------------
+
+        self.router.message.register(
+            self.handle_text,
+            F.text,
+        )
+
+        # ----------------------------------------------------
+        # FINAL CATCH ALL
+        # ----------------------------------------------------
+
+        self.router.message.register(
+            self.handle_unknown
+        )
+
+
+# ============================================================
+# GLOBAL APP
+# ============================================================
 
 App = BotApp
 
 
-# ============================================================================
-# POLLING MODE
-# ============================================================================
+# ============================================================
+# POLLING FALLBACK
+# ============================================================
 
-async def main():
+async def main() -> None:
 
     app = BotApp()
 
-    await app.start()
-
     try:
 
+        await app.start()
+
+        await app.bot.delete_webhook(
+            drop_pending_updates=False
+        )
+
+        log.info(
+            "Starting polling..."
+        )
+
         await app.dp.start_polling(
-            app.bot,
-            allowed_updates=(
-                app.dp.resolve_used_update_types()
-            ),
+            app.bot
         )
 
     finally:
 
         await app.stop()
 
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
 
