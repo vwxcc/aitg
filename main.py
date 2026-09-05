@@ -24,6 +24,9 @@ Optional:
   SUPPORT_USERNAME=@support
   MAX_FILE_SIZE_MB=50
   MAX_CONTEXT_WORDS=10000
+  CHAT_COMPRESSION_WORDS=50000
+  CHAT_COMPRESSION_KEEP_TAIL=20
+  CHAT_COMPRESSION_DELETE_RAW=1
   POLL_TIMEOUT=30
   LOG_LEVEL=INFO
   QUEUE_WORKERS=12
@@ -124,6 +127,9 @@ SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "").strip()
 MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "50"))
 MAX_FILE_SIZE = MAX_FILE_SIZE_MB * 1024 * 1024
 MAX_CONTEXT_WORDS = int(os.getenv("MAX_CONTEXT_WORDS", "10000"))
+CHAT_COMPRESSION_WORDS = int(os.getenv("CHAT_COMPRESSION_WORDS", "50000"))
+CHAT_COMPRESSION_KEEP_TAIL = int(os.getenv("CHAT_COMPRESSION_KEEP_TAIL", "20"))
+CHAT_COMPRESSION_DELETE_RAW = os.getenv("CHAT_COMPRESSION_DELETE_RAW", "1").strip() not in {"0", "false", "False"}
 POLL_TIMEOUT = int(os.getenv("POLL_TIMEOUT", "30"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
@@ -374,6 +380,7 @@ class Database:
                 model_key TEXT,
                 summary TEXT,
                 summary_updated_at TEXT,
+                compressed_through_id INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -520,6 +527,11 @@ class Database:
             );
             """
         )
+        # Backward-compatible migration for databases created before this column existed.
+        try:
+            c.execute("ALTER TABLE chats ADD COLUMN compressed_through_id INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass  # Column already present.
         c.commit()
 
     async def execute(self, sql: str, params: tuple | list = ()) -> sqlite3.Cursor:
@@ -750,6 +762,41 @@ class Repo:
             "UPDATE chats SET summary=?, summary_updated_at=?, updated_at=? WHERE id=?",
             (summary, iso_now(), iso_now(), chat_id),
         )
+
+    async def messages_since_compression(self, chat_id: int) -> list[sqlite3.Row]:
+        """All messages in the chat that haven't been folded into the summary yet."""
+        row = await self.db.fetchone("SELECT compressed_through_id FROM chats WHERE id=?", (chat_id,))
+        since_id = int(row["compressed_through_id"] or 0) if row else 0
+        return await self.db.fetchall(
+            "SELECT id, role, content FROM messages WHERE chat_id=? AND id>? ORDER BY id ASC",
+            (chat_id, since_id),
+        )
+
+    async def mark_compressed(self, chat_id: int, through_id: int) -> None:
+        await self.db.execute("UPDATE chats SET compressed_through_id=? WHERE id=?", (through_id, chat_id))
+
+    async def files_for_message_ids(self, message_ids: list[int]) -> list[sqlite3.Row]:
+        if not message_ids:
+            return []
+        placeholders = ",".join("?" for _ in message_ids)
+        return await self.db.fetchall(
+            f"SELECT id, stored_path FROM files WHERE message_id IN ({placeholders}) AND processing_status!='archived'",
+            tuple(message_ids),
+        )
+
+    async def archive_file_row(self, file_id: int) -> None:
+        """Drop the heavy blobs for a file whose content is already folded into a chat summary."""
+        await self.db.execute(
+            "UPDATE files SET stored_path='', extracted_text=NULL, ocr_result=NULL, transcription=NULL, "
+            "processing_status='archived' WHERE id=?",
+            (file_id,),
+        )
+
+    async def delete_messages(self, message_ids: list[int]) -> None:
+        if not message_ids:
+            return
+        placeholders = ",".join("?" for _ in message_ids)
+        await self.db.execute(f"DELETE FROM messages WHERE id IN ({placeholders})", tuple(message_ids))
 
     async def create_job(self, job_type: str, user_id: int, chat_id: Optional[int], payload: dict, priority: int) -> str:
         job_id = uuid.uuid4().hex
@@ -1747,11 +1794,9 @@ class App:
         send a file directly to the bot.
         """
         buttons = [
-            [KeyboardButton(text="🧠 Модель"), KeyboardButton(text="📚 Режимы")],
-            [KeyboardButton(text="💬 Мои чаты"), KeyboardButton(text="👤 Профиль")],
+            [KeyboardButton(text="🧠 Модель"), KeyboardButton(text="👤 Профиль")],
             [KeyboardButton(text="⚙️ Настройки"), KeyboardButton(text="👥 Рефералы")],
-            [KeyboardButton(text="🔄 Новый чат"), KeyboardButton(text="ℹ️ Помощь")],
-            [KeyboardButton(text="🆘 Поддержка")],
+            [KeyboardButton(text="ℹ️ Помощь"), KeyboardButton(text="🆘 Поддержка")],
         ]
         if await self.repo.is_admin(int(user["telegram_id"])):
             buttons.append([KeyboardButton(text="👑 Админ-панель")])
@@ -2071,11 +2116,10 @@ class App:
             marker = " ✅" if current and model["model_key"] == current["model_key"] else ""
             b.button(text=f"🤖 {model['name']}{marker}", callback_data=f"model:{model['model_key']}")
         b.button(text="🧠 Выбрать модель", callback_data="menu_model")
-        b.button(text="🎓 Сменить режим", callback_data="menu_modes")
         b.button(text="💎 Подписка", callback_data="menu_profile")
         b.button(text="👥 Рефералы", callback_data="menu_ref")
         b.button(text="🆘 Поддержка", callback_data="menu_support")
-        b.adjust(1)
+        b.adjust(2)
         await self.bot.send_message(chat_id, "⚙️ <b>Настройки</b>", reply_markup=b.as_markup())
 
     async def show_chats(self, chat_id: int, user: sqlite3.Row):
@@ -2134,20 +2178,14 @@ class App:
         text = message.text.strip()
         menu_actions = {
             "🧠 Модель": lambda: self.show_model_selection(message.chat.id, user),
-            "📚 Режимы": lambda: self.show_modes(message.chat.id, user),
-            "💬 Мои чаты": lambda: self.show_chats(message.chat.id, user),
             "👤 Профиль": lambda: self.show_profile(message.chat.id, user),
             "⚙️ Настройки": lambda: self.show_settings(message.chat.id, user),
             "👥 Рефералы": lambda: self.show_referrals(message.chat.id, user),
-            "🔄 Новый чат": lambda: self.repo.create_chat(int(user["id"]), user["selected_model_id"]),
             "ℹ️ Помощь": lambda: self.send_help(message),
             "🆘 Поддержка": lambda: self.show_support(message.chat.id),
         }
         if text in menu_actions:
-            action = menu_actions[text]
-            result = await action()
-            if text == "🔄 Новый чат":
-                await message.answer("✅ Новый чат создан.", reply_markup=await self.main_keyboard(user))
+            await menu_actions[text]()
             return
         if text == "👑 Админ-панель":
             if await self.repo.is_admin(message.from_user.id):
@@ -2261,7 +2299,7 @@ class App:
                 b.button(text="Попробовать другую модель", callback_data="retry_other_model")
             if SUPPORT_USERNAME:
                 b.button(text="🆘 Поддержка", url=f"https://t.me/{SUPPORT_USERNAME.lstrip('@')}")
-            b.adjust(1)
+            b.adjust(2)
             reset_txt = human_duration(int((reset_at - utc_now()).total_seconds())) if reset_at else "позже"
             await message.answer(
                 f"⏳ Лимит этой модели временно исчерпан.\n\nЛимит обновится через {reset_txt}.",
@@ -2487,18 +2525,40 @@ class App:
         return messages
 
     async def maybe_summarize(self, chat_id: int, user: sqlite3.Row, current_model: sqlite3.Row):
-        rows = await self.repo.recent_messages(chat_id, 200)
-        joined = "\n".join(f"{r['role']}: {r['content']}" for r in rows)
-        if word_count(joined) < int(MAX_CONTEXT_WORDS * 1.05):
+        """Compress chat history once the uncompressed tail crosses the word threshold.
+
+        Unlike a context-window trim, this tracks a real running total per chat
+        (via chats.compressed_through_id) so it fires once every
+        CHAT_COMPRESSION_WORDS words of *new* history, not on every message
+        after some fixed window is already full.
+        """
+        rows = await self.repo.messages_since_compression(chat_id)
+        threshold = int(await self.repo.get_setting("chat_compression_words", str(CHAT_COMPRESSION_WORDS)) or CHAT_COMPRESSION_WORDS)
+        total_words = sum(word_count(r["content"]) for r in rows)
+        if total_words < threshold:
             return
+
+        # Keep the most recent messages verbatim (they're still cheap to send
+        # as-is); fold everything older than that into the summary.
+        tail = rows[-CHAT_COMPRESSION_KEEP_TAIL:] if len(rows) > CHAT_COMPRESSION_KEEP_TAIL else []
+        to_fold = rows[: len(rows) - len(tail)]
+        if not to_fold:
+            return
+
         summary_model_key = (await self.repo.get_setting("summary_model_id", "")) or current_model["model_key"]
         summary_model = await self.repo.get_model(summary_model_key)
         if not summary_model or not summary_model["enabled"]:
             return
+
+        existing_summary = await self.repo.get_summary(chat_id)
+        joined = "\n".join(f"{r['role']}: {r['content']}" for r in to_fold)
         prompt = (
-            "Сделай содержательное резюме старой части диалога. Сохрани факты, цели, решения, "
+            "Сделай содержательное резюме диалога, объединив предыдущее резюме (если оно есть) "
+            "с новой частью истории ниже в одно целое. Сохрани факты, цели, решения, "
             "незавершённые задачи, требования пользователя, важные числа, связь с файлами и результаты. "
-            "Не пиши общие фразы вроде 'обсуждали домашнюю работу'.\n\n" + truncate_text(joined, 60_000)
+            "Не пиши общие фразы вроде 'обсуждали домашнюю работу'.\n\n"
+            + (f"Предыдущее резюме:\n{truncate_text(existing_summary, 20_000)}\n\n" if existing_summary else "")
+            + "Новая часть истории:\n" + truncate_text(joined, 80_000)
         )
         messages = [
             {"role": "system", "content": "Ты создаёшь внутреннее резюме диалога. Не раскрывай скрытое reasoning."},
@@ -2508,8 +2568,32 @@ class App:
             result = await self.ai.request(summary_model, messages, user)
             if result.text.strip():
                 await self.repo.save_summary(chat_id, result.text.strip())
+                await self.repo.mark_compressed(chat_id, int(to_fold[-1]["id"]))
+                if CHAT_COMPRESSION_DELETE_RAW:
+                    await self._purge_folded_data(to_fold)
         except Exception as exc:
             log.warning("Summary failed: %s", type(exc).__name__)
+
+    async def _purge_folded_data(self, to_fold: list[sqlite3.Row]):
+        """Reclaim disk/DB space for content already folded into a chat summary.
+
+        Once a message (and any file that produced it) has been summarized,
+        its substance lives on in chats.summary — the raw copy is no longer
+        needed for context, so we delete the file from disk, blank out the
+        heavy text columns on its `files` row (kept only for admin stats),
+        and drop the raw `messages` row itself.
+        """
+        fold_ids = [int(r["id"]) for r in to_fold]
+        files = await self.repo.files_for_message_ids(fold_ids)
+        for f in files:
+            path = f["stored_path"]
+            if path:
+                try:
+                    Path(path).unlink(missing_ok=True)
+                except Exception:
+                    log.warning("Could not delete archived file on disk: %s", path)
+            await self.repo.archive_file_row(int(f["id"]))
+        await self.repo.delete_messages(fold_ids)
 
     def format_knowledge(self, rows: list[sqlite3.Row]) -> str:
         if not rows:
@@ -3311,4 +3395,6 @@ async def main():
 
 if __name__ == "__main__":
     try:
-        asyn
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
