@@ -90,7 +90,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, Teleg
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import CallbackQuery, Document, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, Document, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 from dotenv import load_dotenv
 
@@ -1739,19 +1739,29 @@ class App:
             builder.button(text="🆘 Поддержка", url=f"https://t.me/{SUPPORT_USERNAME.lstrip('@')}")
         return builder.as_markup()
 
-    async def main_keyboard(self, user: sqlite3.Row) -> InlineKeyboardMarkup:
-        builder = InlineKeyboardBuilder()
-        builder.button(text="🤖 ИИ", callback_data="menu_ai")
-        builder.button(text="📚 Режимы", callback_data="menu_modes")
-        builder.button(text="📎 Файлы", callback_data="menu_files")
-        builder.button(text="💬 Мои чаты", callback_data="menu_chats")
-        builder.button(text="👤 Профиль", callback_data="menu_profile")
-        builder.button(text="⚙️ Настройки", callback_data="menu_settings")
-        builder.button(text="🆘 Поддержка", callback_data="menu_support")
+    async def main_keyboard(self, user: sqlite3.Row) -> ReplyKeyboardMarkup:
+        """Main Telegram reply keyboard.
+
+        ReplyKeyboard buttons are plain text, so their actions are routed in
+        handle_text(). Files intentionally have no separate button: users can
+        send a file directly to the bot.
+        """
+        buttons = [
+            [KeyboardButton(text="🧠 Модель"), KeyboardButton(text="📚 Режимы")],
+            [KeyboardButton(text="💬 Мои чаты"), KeyboardButton(text="👤 Профиль")],
+            [KeyboardButton(text="⚙️ Настройки"), KeyboardButton(text="👥 Рефералы")],
+            [KeyboardButton(text="🔄 Новый чат"), KeyboardButton(text="ℹ️ Помощь")],
+            [KeyboardButton(text="🆘 Поддержка")],
+        ]
         if await self.repo.is_admin(int(user["telegram_id"])):
-            builder.button(text="👑 Админ-панель", callback_data="admin_home")
-        builder.adjust(2, 2, 2, 1, 1)
-        return builder.as_markup()
+            buttons.append([KeyboardButton(text="👑 Админ-панель")])
+
+        return ReplyKeyboardMarkup(
+            keyboard=buttons,
+            resize_keyboard=True,
+            is_persistent=True,
+            input_field_placeholder="Напишите вопрос или выберите действие",
+        )
 
     async def send_status(self, message: Message, text: str) -> Optional[Message]:
         try:
@@ -1848,12 +1858,13 @@ class App:
 
         if data.startswith("menu_"):
             action = data[5:]
-            if action == "ai":
-                await self.bot.send_message(callback.message.chat.id, "🤖 Отправь вопрос сообщением — я отвечу в выбранном режиме.")
+            if action == "ai" or action == "model":
+                await self.show_model_selection(callback.message.chat.id, user)
             elif action == "modes":
                 await self.show_modes(callback.message.chat.id, user)
             elif action == "files":
-                await self.bot.send_message(callback.message.chat.id, "📎 Пришли файл прямо сюда. Поддерживаются документы, таблицы, презентации, изображения, аудио и видео.")
+                # Kept for compatibility with old inline keyboards.
+                await self.bot.send_message(callback.message.chat.id, "📎 Пришли файл прямо сюда. Отдельной кнопки для файлов больше нет.")
             elif action == "chats":
                 await self.show_chats(callback.message.chat.id, user)
             elif action == "profile":
@@ -1884,7 +1895,12 @@ class App:
             model = await self.repo.get_model(key)
             if model and model["enabled"]:
                 await self.repo.update_user(callback.from_user.id, selected_model_id=key)
-                await self.bot.send_message(callback.message.chat.id, f"✅ Модель: {model['name']}")
+                updated_user = await self.repo.get_user(callback.from_user.id)
+                await self.bot.send_message(
+                    callback.message.chat.id,
+                    f"✅ Модель: <b>{model['name']}</b>",
+                    reply_markup=await self.main_keyboard(updated_user or user),
+                )
             return
 
         if data == "retry_other_model":
@@ -1992,6 +2008,36 @@ class App:
                 return
             await self.handle_admin_callback(callback.message.chat.id, data.split(":", 1)[1], user)
 
+    async def show_model_selection(self, chat_id: int, user: sqlite3.Row):
+        """Show every enabled model and clearly mark the current one."""
+        models = await self.repo.get_models(enabled_only=True)
+        current = await self.selected_model(user)
+
+        if not models:
+            await self.bot.send_message(
+                chat_id,
+                "❌ Сейчас нет доступных AI-моделей. Администратору нужно добавить модель через админку.",
+            )
+            return
+
+        builder = InlineKeyboardBuilder()
+        for model in models:
+            marker = " ✅" if current and model["model_key"] == current["model_key"] else ""
+            builder.button(
+                text=f"🧠 {model['name']}{marker}",
+                callback_data=f"model:{model['model_key']}",
+            )
+        builder.adjust(1)
+
+        current_name = current["name"] if current else "не выбрана"
+        await self.bot.send_message(
+            chat_id,
+            f"🧠 <b>Выбор модели</b>\n\n"
+            f"Текущая модель: <b>{current_name}</b>\n\n"
+            "Выберите модель:",
+            reply_markup=builder.as_markup(),
+        )
+
     async def show_modes(self, chat_id: int, user: sqlite3.Row):
         b = InlineKeyboardBuilder()
         for mode, title in [("student", "🎓 Ученик"), ("teacher", "👩‍🏫 Учитель"), ("applicant", "🎯 Поступающий")]:
@@ -2019,9 +2065,12 @@ class App:
 
     async def show_settings(self, chat_id: int, user: sqlite3.Row):
         models = await self.repo.get_models(enabled_only=True)
+        current = await self.selected_model(user)
         b = InlineKeyboardBuilder()
         for model in models:
-            b.button(text=f"🤖 {model['name']}", callback_data=f"model:{model['model_key']}")
+            marker = " ✅" if current and model["model_key"] == current["model_key"] else ""
+            b.button(text=f"🤖 {model['name']}{marker}", callback_data=f"model:{model['model_key']}")
+        b.button(text="🧠 Выбрать модель", callback_data="menu_model")
         b.button(text="🎓 Сменить режим", callback_data="menu_modes")
         b.button(text="💎 Подписка", callback_data="menu_profile")
         b.button(text="👥 Рефералы", callback_data="menu_ref")
@@ -2056,6 +2105,21 @@ class App:
     # Text / files intake
     # ------------------------------------------------------------------
 
+    async def send_help(self, message: Message):
+        await message.answer(
+            "Отправь вопрос обычным сообщением. Можно прикладывать PDF, DOCX, XLSX, CSV, "
+            "PPTX, изображения, аудио и видео.\n\n"
+            "Файл можно отправить напрямую — отдельная кнопка для файлов не нужна."
+        )
+
+    async def show_support(self, chat_id: int):
+        txt = "🆘 <b>Поддержка</b>"
+        if SUPPORT_USERNAME:
+            txt += f"\n\nОбратитесь: {SUPPORT_USERNAME}"
+            await self.bot.send_message(chat_id, txt, reply_markup=self.support_keyboard())
+        else:
+            await self.bot.send_message(chat_id, txt)
+
     async def handle_text(self, message: Message):
         user = await self.ensure_user(message)
         if not user or not message.text:
@@ -2065,6 +2129,32 @@ class App:
             if message.chat.id in self.model_wizards:
                 await self.handle_model_wizard_message(message)
                 return
+
+        # Main ReplyKeyboard actions.
+        text = message.text.strip()
+        menu_actions = {
+            "🧠 Модель": lambda: self.show_model_selection(message.chat.id, user),
+            "📚 Режимы": lambda: self.show_modes(message.chat.id, user),
+            "💬 Мои чаты": lambda: self.show_chats(message.chat.id, user),
+            "👤 Профиль": lambda: self.show_profile(message.chat.id, user),
+            "⚙️ Настройки": lambda: self.show_settings(message.chat.id, user),
+            "👥 Рефералы": lambda: self.show_referrals(message.chat.id, user),
+            "🔄 Новый чат": lambda: self.repo.create_chat(int(user["id"]), user["selected_model_id"]),
+            "ℹ️ Помощь": lambda: self.send_help(message),
+            "🆘 Поддержка": lambda: self.show_support(message.chat.id),
+        }
+        if text in menu_actions:
+            action = menu_actions[text]
+            result = await action()
+            if text == "🔄 Новый чат":
+                await message.answer("✅ Новый чат создан.", reply_markup=await self.main_keyboard(user))
+            return
+        if text == "👑 Админ-панель":
+            if await self.repo.is_admin(message.from_user.id):
+                await self.show_admin_home(message.chat.id)
+            else:
+                await message.answer("❌ Доступ запрещён.")
+            return
 
         # Pending ASK_USER continuation.
         pending = await self.repo.get_pending_question(int(user["id"]))
