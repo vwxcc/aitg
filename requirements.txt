@@ -1,5 +1,5 @@
 aiogram>=3.20,<4
-aiohttp>=3.10
+aiohttp>=3.11
 python-dotenv>=1.0
 PyMuPDF>=1.24
 python-docx>=1.1
@@ -11,3 +11,4 @@ pillow-heif>=0.18
 pandas>=2.2
 odfpy>=1.4
 pydub>=0.25
+pypdf>=5.0
