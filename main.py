@@ -26,14 +26,11 @@ Optional:
   MAX_CONTEXT_WORDS=10000
   POLL_TIMEOUT=30
   LOG_LEVEL=INFO
-  QUEUE_WORKERS=12
-  FILE_CONCURRENCY=2
-  OCR_CONCURRENCY=1
-  MEDIA_CONCURRENCY=1
 
 Dependencies (recommended):
   aiogram>=3.20,<4
   aiohttp>=3.10
+  aiosqlite>=0.20
   python-dotenv>=1.0
   PyMuPDF>=1.24
   python-docx>=1.1
@@ -90,7 +87,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, Teleg
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import CallbackQuery, Document, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup
+from aiogram.types import CallbackQuery, Document, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 from dotenv import load_dotenv
 
@@ -587,23 +584,13 @@ class Repo:
                 (key, value, iso_now()),
             )
 
-        # Migrate old installations: before this version `mode` duplicated `role`.
-        # Keep authorization semantics in `role` and synchronize only known user modes.
-        await self.db.execute(
-            "UPDATE users SET role=mode, updated_at=? "
-            "WHERE mode IN ('student','teacher','applicant') AND role='student' AND mode!='student'",
-            (iso_now(),),
-        )
-
         # Seed only the admin IDs from env, never the token/key.
         for tg_id in ADMIN_IDS:
             user = await self.get_user(tg_id)
             if not user:
                 await self.ensure_user_obj(tg_id, None, None, None, None)
                 user = await self.get_user(tg_id)
-            # Authorization is stored separately in `admins`; do not force the
-            # assistant role back to `admin` on every restart. An admin can still
-            # choose student/teacher/applicant behavior for AI responses.
+            await self.db.execute("UPDATE users SET role='admin', updated_at=? WHERE telegram_id=?", (iso_now(), tg_id))
             if user:
                 await self.db.execute(
                     "INSERT OR IGNORE INTO admins(user_id,telegram_id,level,created_at) VALUES(?,?,?,?)",
@@ -661,21 +648,6 @@ class Repo:
         pairs = [(k, v) for k, v in fields.items() if k in allowed]
         if not pairs:
             return
-
-        # `role` is authoritative for assistant behavior. Keep `mode` synchronized
-        # so databases created by older versions remain compatible.
-        field_names = {k for k, _ in pairs}
-        if "role" in field_names:
-            role_value = next(v for k, v in pairs if k == "role")
-            if role_value in MODE_PROMPTS:
-                pairs = [(k, v) for k, v in pairs if k != "mode"]
-                pairs.append(("mode", role_value))
-        elif "mode" in field_names:
-            mode_value = next(v for k, v in pairs if k == "mode")
-            if mode_value in MODE_PROMPTS:
-                pairs = [(k, v) for k, v in pairs if k != "role"]
-                pairs.append(("role", mode_value))
-
         sets = ", ".join(f"{k}=?" for k, _ in pairs) + ", updated_at=?"
         values = [v for _, v in pairs] + [iso_now(), telegram_id]
         await self.db.execute(f"UPDATE users SET {sets} WHERE telegram_id=?", tuple(values))
@@ -722,17 +694,6 @@ class Repo:
         )
         await self.db.execute("UPDATE chats SET updated_at=? WHERE id=?", (iso_now(), chat_id))
         return int(cur.lastrowid)
-
-    async def update_message(
-        self,
-        message_id: int,
-        content: str,
-        model_key: Optional[str] = None,
-    ) -> None:
-        await self.db.execute(
-            "UPDATE messages SET content=?, model_key=? WHERE id=?",
-            (content, model_key, message_id),
-        )
 
     async def recent_messages(self, chat_id: int, limit: int = 100) -> list[sqlite3.Row]:
         rows = await self.db.fetchall(
@@ -1029,7 +990,7 @@ class Repo:
         return int(cur.lastrowid)
 
     async def update_file(self, file_id: int, **fields: Any) -> None:
-        allowed = {"processing_status", "extracted_text", "ocr_result", "transcription", "metadata_json", "message_id"}
+        allowed = {"processing_status", "extracted_text", "ocr_result", "transcription", "metadata_json"}
         pairs = [(k, v) for k, v in fields.items() if k in allowed]
         if not pairs:
             return
@@ -1086,12 +1047,8 @@ MODE_PROMPTS = {
 
 
 def build_system_prompt(user: sqlite3.Row, extra_context: str = "") -> str:
-    # `role` is the single source of truth for the assistant behavior.
-    # The old `mode` column is kept only for DB backward compatibility.
-    role = str(user["role"] or "student").strip().lower()
-    if role not in MODE_PROMPTS:
-        role = "student"
-    return f"{BASE_SYSTEM_PROMPT}\n\nТекущий режим:\n{MODE_PROMPTS[role]}\n\n{extra_context}".strip()
+    mode = user["mode"] if user["mode"] in MODE_PROMPTS else "student"
+    return f"{BASE_SYSTEM_PROMPT}\n\nТекущий режим:\n{MODE_PROMPTS[mode]}\n\n{extra_context}".strip()
 
 
 @dataclass
@@ -1459,26 +1416,20 @@ class FileProcessor:
         raise RuntimeError("PPT/ODP требуют внешнюю конвертацию; базовый обработчик поддерживает PPTX")
 
     async def _image(self, path: Path) -> FileResult:
-        # We keep the original upload on disk. A converted HEIC is temporary only.
+        # We keep image storage on disk. OCR is optional; the actual image can be passed to a vision-capable provider later.
         normalized = path
-        temporary_normalized: Optional[Path] = None
         if path.suffix.lower() in {".heic", ".heif"}:
             normalized = await self._convert_heic(path)
-            if normalized != path:
-                temporary_normalized = normalized
         try:
-            try:
-                from PIL import Image
-                with Image.open(normalized) as img:
-                    meta = {"width": img.width, "height": img.height, "format": img.format}
-            except Exception:
-                meta = {}
-            async with self.ocr_sem:
-                ocr_text = await self._ocr(normalized)
-            return FileResult(text=ocr_text, kind="image", ocr_text=ocr_text, metadata=meta)
-        finally:
-            if temporary_normalized:
-                temporary_normalized.unlink(missing_ok=True)
+            from PIL import Image
+            with Image.open(normalized) as img:
+                meta = {"width": img.width, "height": img.height, "format": img.format}
+        except Exception:
+            meta = {}
+        ocr_text = ""
+        async with self.ocr_sem:
+            ocr_text = await self._ocr(normalized)
+        return FileResult(text=ocr_text, kind="image", ocr_text=ocr_text, metadata=meta)
 
     async def _ocr(self, path: Path) -> str:
         try:
@@ -1496,16 +1447,9 @@ class FileProcessor:
             import pillow_heif  # type: ignore
             pillow_heif.register_heif_opener()
             img = await asyncio.to_thread(Image.open, path)
-            try:
-                await asyncio.to_thread(img.save, out, format="PNG")
-            finally:
-                try:
-                    img.close()
-                except Exception:
-                    pass
+            await asyncio.to_thread(img.save, out, format="PNG")
             return out
         except Exception as exc:
-            out.unlink(missing_ok=True)
             log.warning("HEIC conversion failed: %s", type(exc).__name__)
             return path
 
@@ -1603,7 +1547,6 @@ class PriorityQueueManager:
     async def _worker_loop(self):
         while self.running:
             item = await self.queue.get()
-            task_done = False
             try:
                 await self.repo.update_job(item.job_id, STATUS_RUNNING)
                 if item.kind == "ai":
@@ -1616,22 +1559,13 @@ class PriorityQueueManager:
                     raise RuntimeError(f"Unknown queue kind: {item.kind}")
                 await self.repo.update_job(item.job_id, STATUS_COMPLETED)
             except asyncio.CancelledError:
-                try:
-                    await self.repo.update_job(item.job_id, STATUS_INTERRUPTED)
-                finally:
-                    self.queue.task_done()
-                    task_done = True
+                await self.repo.update_job(item.job_id, STATUS_INTERRUPTED)
                 raise
             except Exception as exc:
                 log.exception("Queue job %s failed", item.job_id)
-                await self.repo.update_job(
-                    item.job_id,
-                    STATUS_FAILED,
-                    error=f"{type(exc).__name__}: {exc}",
-                )
+                await self.repo.update_job(item.job_id, STATUS_FAILED, error=f"{type(exc).__name__}: {exc}")
             finally:
-                if not task_done:
-                    self.queue.task_done()
+                self.queue.task_done()
 
 
 # -----------------------------------------------------------------------------
@@ -1649,7 +1583,6 @@ class App:
         self.router = Router()
         self.queue = PriorityQueueManager(self.repo, self.run_ai_job, self.run_file_job, self.run_broadcast_job)
         self.broadcast_sem = asyncio.Semaphore(1)
-        self.model_wizards: dict[int, dict[str, object]] = {}
         self.router.message.register(self.handle_start, CommandStart())
         self.router.message.register(self.handle_commands, Command(commands=["help", "profile", "settings", "ref", "admin", "newchat"]))
         self.router.callback_query.register(self.handle_callback)
@@ -1739,29 +1672,19 @@ class App:
             builder.button(text="🆘 Поддержка", url=f"https://t.me/{SUPPORT_USERNAME.lstrip('@')}")
         return builder.as_markup()
 
-    async def main_keyboard(self, user: sqlite3.Row) -> ReplyKeyboardMarkup:
-        """Main Telegram reply keyboard.
-
-        ReplyKeyboard buttons are plain text, so their actions are routed in
-        handle_text(). Files intentionally have no separate button: users can
-        send a file directly to the bot.
-        """
-        buttons = [
-            [KeyboardButton(text="🧠 Модель"), KeyboardButton(text="📚 Режимы")],
-            [KeyboardButton(text="💬 Мои чаты"), KeyboardButton(text="👤 Профиль")],
-            [KeyboardButton(text="⚙️ Настройки"), KeyboardButton(text="👥 Рефералы")],
-            [KeyboardButton(text="🔄 Новый чат"), KeyboardButton(text="ℹ️ Помощь")],
-            [KeyboardButton(text="🆘 Поддержка")],
-        ]
-        if await self.repo.is_admin(int(user["telegram_id"])):
-            buttons.append([KeyboardButton(text="👑 Админ-панель")])
-
-        return ReplyKeyboardMarkup(
-            keyboard=buttons,
-            resize_keyboard=True,
-            is_persistent=True,
-            input_field_placeholder="Напишите вопрос или выберите действие",
-        )
+    def main_keyboard(self, user: sqlite3.Row) -> InlineKeyboardMarkup:
+        builder = InlineKeyboardBuilder()
+        builder.button(text="🤖 ИИ", callback_data="menu_ai")
+        builder.button(text="📚 Режимы", callback_data="menu_modes")
+        builder.button(text="📎 Файлы", callback_data="menu_files")
+        builder.button(text="💬 Мои чаты", callback_data="menu_chats")
+        builder.button(text="👤 Профиль", callback_data="menu_profile")
+        builder.button(text="⚙️ Настройки", callback_data="menu_settings")
+        builder.button(text="🆘 Поддержка", callback_data="menu_support")
+        if user["role"] == "admin":
+            builder.button(text="👑 Админ-панель", callback_data="admin_home")
+        builder.adjust(2, 2, 2, 1, 1)
+        return builder.as_markup()
 
     async def send_status(self, message: Message, text: str) -> Optional[Message]:
         try:
@@ -1817,7 +1740,7 @@ class App:
             f"Привет, {name}! 👋\n\n"
             "Я AI-помощник для учёбы, документов, поступления и обычных вопросов.\n\n"
             "Просто отправь сообщение или файл.",
-            reply_markup=await self.main_keyboard(user),
+            reply_markup=self.main_keyboard(user),
         )
 
     async def handle_commands(self, message: Message):
@@ -1858,13 +1781,12 @@ class App:
 
         if data.startswith("menu_"):
             action = data[5:]
-            if action == "ai" or action == "model":
-                await self.show_model_selection(callback.message.chat.id, user)
+            if action == "ai":
+                await self.bot.send_message(callback.message.chat.id, "🤖 Отправь вопрос сообщением — я отвечу в выбранном режиме.")
             elif action == "modes":
                 await self.show_modes(callback.message.chat.id, user)
             elif action == "files":
-                # Kept for compatibility with old inline keyboards.
-                await self.bot.send_message(callback.message.chat.id, "📎 Пришли файл прямо сюда. Отдельной кнопки для файлов больше нет.")
+                await self.bot.send_message(callback.message.chat.id, "📎 Пришли файл прямо сюда. Поддерживаются документы, таблицы, презентации, изображения, аудио и видео.")
             elif action == "chats":
                 await self.show_chats(callback.message.chat.id, user)
             elif action == "profile":
@@ -1886,7 +1808,7 @@ class App:
                 return
             if mode == "admin" and not await self.repo.is_admin(callback.from_user.id):
                 return
-            await self.repo.update_user(callback.from_user.id, role=mode)
+            await self.repo.update_user(callback.from_user.id, mode=mode)
             await self.bot.send_message(callback.message.chat.id, f"✅ Режим: {mode}")
             return
 
@@ -1895,12 +1817,7 @@ class App:
             model = await self.repo.get_model(key)
             if model and model["enabled"]:
                 await self.repo.update_user(callback.from_user.id, selected_model_id=key)
-                updated_user = await self.repo.get_user(callback.from_user.id)
-                await self.bot.send_message(
-                    callback.message.chat.id,
-                    f"✅ Модель: <b>{model['name']}</b>",
-                    reply_markup=await self.main_keyboard(updated_user or user),
-                )
+                await self.bot.send_message(callback.message.chat.id, f"✅ Модель: {model['name']}")
             return
 
         if data == "retry_other_model":
@@ -1911,138 +1828,16 @@ class App:
             if await self.repo.is_admin(callback.from_user.id):
                 await self.show_admin_home(callback.message.chat.id)
             return
-
-        if data.startswith("admin:model_"):
-            if not await self.repo.is_admin(callback.from_user.id):
-                return
-
-            chat_id = callback.message.chat.id
-            action = data.split(":", 1)[1]
-
-            if action == "model_add":
-                await self.start_model_wizard(chat_id, mode="add")
-                return
-
-            if action == "model_home":
-                await self.show_admin_models(chat_id)
-                return
-
-            if action.startswith("model_edit:"):
-                key = action.split(":", 1)[1]
-                await self.start_model_wizard(chat_id, mode="edit", model_key=key)
-                return
-
-            if action.startswith("model_toggle:"):
-                key = action.split(":", 1)[1]
-                model = await self.repo.get_model(key)
-                if not model:
-                    await self.bot.send_message(chat_id, "❌ Модель не найдена.")
-                    return
-                new_enabled = 0 if int(model["enabled"]) else 1
-                await self.db.execute(
-                    "UPDATE models SET enabled=?, updated_at=? WHERE model_key=?",
-                    (new_enabled, iso_now(), key),
-                )
-                self.ai.semaphores.pop(key, None)
-                await self.show_admin_models(chat_id)
-                return
-
-            if action.startswith("model_default:"):
-                key = action.split(":", 1)[1]
-                model = await self.repo.get_model(key)
-                if not model or not model["enabled"]:
-                    await self.bot.send_message(chat_id, "❌ Модель должна существовать и быть включённой.")
-                    return
-                await self.repo.set_setting("default_model_id", key)
-                await self.bot.send_message(chat_id, f"⭐ Модель по умолчанию: {model['name']}")
-                await self.show_admin_models(chat_id)
-                return
-
-            if action.startswith("model_summary:"):
-                key = action.split(":", 1)[1]
-                model = await self.repo.get_model(key)
-                if not model or not model["enabled"]:
-                    await self.bot.send_message(chat_id, "❌ Модель должна существовать и быть включённой.")
-                    return
-                await self.repo.set_setting("summary_model_id", key)
-                await self.bot.send_message(chat_id, f"📝 Модель резюме: {model['name']}")
-                await self.show_admin_models(chat_id)
-                return
-
-            if action.startswith("model_delete:"):
-                key = action.split(":", 1)[1]
-
-                default_key = await self.repo.get_setting("default_model_id", "")
-                if key == default_key:
-                    await self.bot.send_message(
-                        chat_id,
-                        "❌ Нельзя удалить модель по умолчанию. Сначала выберите другую модель по умолчанию.",
-                    )
-                    return
-
-                model = await self.repo.get_model(key)
-                if not model:
-                    await self.bot.send_message(chat_id, "❌ Модель не найдена.")
-                    return
-
-                summary_key = await self.repo.get_setting("summary_model_id", "")
-                if key == summary_key:
-                    await self.repo.set_setting("summary_model_id", "")
-
-                await self.db.execute(
-                    "UPDATE users SET selected_model_id=NULL WHERE selected_model_id=?",
-                    (key,),
-                )
-                await self.db.execute(
-                    "DELETE FROM models WHERE model_key=?",
-                    (key,),
-                )
-                self.ai.semaphores.pop(key, None)
-
-                await self.bot.send_message(chat_id, f"🗑 Удалена: {model['name']}")
-                await self.show_admin_models(chat_id)
-                return
-
         if data.startswith("admin:"):
             if not await self.repo.is_admin(callback.from_user.id):
                 return
             await self.handle_admin_callback(callback.message.chat.id, data.split(":", 1)[1], user)
 
-    async def show_model_selection(self, chat_id: int, user: sqlite3.Row):
-        """Show every enabled model and clearly mark the current one."""
-        models = await self.repo.get_models(enabled_only=True)
-        current = await self.selected_model(user)
-
-        if not models:
-            await self.bot.send_message(
-                chat_id,
-                "❌ Сейчас нет доступных AI-моделей. Администратору нужно добавить модель через админку.",
-            )
-            return
-
-        builder = InlineKeyboardBuilder()
-        for model in models:
-            marker = " ✅" if current and model["model_key"] == current["model_key"] else ""
-            builder.button(
-                text=f"🧠 {model['name']}{marker}",
-                callback_data=f"model:{model['model_key']}",
-            )
-        builder.adjust(1)
-
-        current_name = current["name"] if current else "не выбрана"
-        await self.bot.send_message(
-            chat_id,
-            f"🧠 <b>Выбор модели</b>\n\n"
-            f"Текущая модель: <b>{current_name}</b>\n\n"
-            "Выберите модель:",
-            reply_markup=builder.as_markup(),
-        )
-
     async def show_modes(self, chat_id: int, user: sqlite3.Row):
         b = InlineKeyboardBuilder()
         for mode, title in [("student", "🎓 Ученик"), ("teacher", "👩‍🏫 Учитель"), ("applicant", "🎯 Поступающий")]:
             b.button(text=title, callback_data=f"mode:{mode}")
-        if await self.repo.is_admin(int(user["telegram_id"])):
+        if user["role"] == "admin":
             b.button(text="🛠 Администратор", callback_data="mode:admin")
         b.adjust(1)
         await self.bot.send_message(chat_id, "📚 Выберите режим:", reply_markup=b.as_markup())
@@ -2065,12 +1860,9 @@ class App:
 
     async def show_settings(self, chat_id: int, user: sqlite3.Row):
         models = await self.repo.get_models(enabled_only=True)
-        current = await self.selected_model(user)
         b = InlineKeyboardBuilder()
         for model in models:
-            marker = " ✅" if current and model["model_key"] == current["model_key"] else ""
-            b.button(text=f"🤖 {model['name']}{marker}", callback_data=f"model:{model['model_key']}")
-        b.button(text="🧠 Выбрать модель", callback_data="menu_model")
+            b.button(text=f"🤖 {model['name']}", callback_data=f"model:{model['model_key']}")
         b.button(text="🎓 Сменить режим", callback_data="menu_modes")
         b.button(text="💎 Подписка", callback_data="menu_profile")
         b.button(text="👥 Рефералы", callback_data="menu_ref")
@@ -2105,55 +1897,9 @@ class App:
     # Text / files intake
     # ------------------------------------------------------------------
 
-    async def send_help(self, message: Message):
-        await message.answer(
-            "Отправь вопрос обычным сообщением. Можно прикладывать PDF, DOCX, XLSX, CSV, "
-            "PPTX, изображения, аудио и видео.\n\n"
-            "Файл можно отправить напрямую — отдельная кнопка для файлов не нужна."
-        )
-
-    async def show_support(self, chat_id: int):
-        txt = "🆘 <b>Поддержка</b>"
-        if SUPPORT_USERNAME:
-            txt += f"\n\nОбратитесь: {SUPPORT_USERNAME}"
-            await self.bot.send_message(chat_id, txt, reply_markup=self.support_keyboard())
-        else:
-            await self.bot.send_message(chat_id, txt)
-
     async def handle_text(self, message: Message):
         user = await self.ensure_user(message)
         if not user or not message.text:
-            return
-
-        if await self.repo.is_admin(message.from_user.id):
-            if message.chat.id in self.model_wizards:
-                await self.handle_model_wizard_message(message)
-                return
-
-        # Main ReplyKeyboard actions.
-        text = message.text.strip()
-        menu_actions = {
-            "🧠 Модель": lambda: self.show_model_selection(message.chat.id, user),
-            "📚 Режимы": lambda: self.show_modes(message.chat.id, user),
-            "💬 Мои чаты": lambda: self.show_chats(message.chat.id, user),
-            "👤 Профиль": lambda: self.show_profile(message.chat.id, user),
-            "⚙️ Настройки": lambda: self.show_settings(message.chat.id, user),
-            "👥 Рефералы": lambda: self.show_referrals(message.chat.id, user),
-            "🔄 Новый чат": lambda: self.repo.create_chat(int(user["id"]), user["selected_model_id"]),
-            "ℹ️ Помощь": lambda: self.send_help(message),
-            "🆘 Поддержка": lambda: self.show_support(message.chat.id),
-        }
-        if text in menu_actions:
-            action = menu_actions[text]
-            result = await action()
-            if text == "🔄 Новый чат":
-                await message.answer("✅ Новый чат создан.", reply_markup=await self.main_keyboard(user))
-            return
-        if text == "👑 Админ-панель":
-            if await self.repo.is_admin(message.from_user.id):
-                await self.show_admin_home(message.chat.id)
-            else:
-                await message.answer("❌ Доступ запрещён.")
             return
 
         # Pending ASK_USER continuation.
@@ -2287,8 +2033,8 @@ class App:
     # ------------------------------------------------------------------
 
     async def run_ai_job(self, job_id: str, payload: dict[str, Any]):
-        user_id: Optional[int] = None
-        chat_id: Optional[int] = None
+        user_id = None
+        chat_id = None
         try:
             job = await self.db.fetchone("SELECT * FROM jobs WHERE id=?", (job_id,))
             if not job:
@@ -2306,56 +2052,25 @@ class App:
             allowed, reset_at, _ = await self.can_use_model(user, model)
             if not allowed:
                 reset_txt = human_duration(int((reset_at - utc_now()).total_seconds())) if reset_at else "позже"
-                await self.bot.send_message(
-                    payload["telegram_chat_id"],
-                    f"⏳ Лимит этой модели временно исчерпан. Лимит обновится через {reset_txt}.",
-                )
+                await self.bot.send_message(payload["telegram_chat_id"], f"⏳ Лимит этой модели временно исчерпан. Лимит обновится через {reset_txt}.")
                 return
 
             await self.bot.send_message(payload["telegram_chat_id"], TEXT_AI)
-            await self.repo.record_event(
-                "processing_started",
-                user_id,
-                chat_id,
-                {"source": payload.get("source", "text")},
-            )
+            await self.repo.record_event("processing_started", user_id, chat_id, {})
 
-            messages = await self.build_context_messages(
-                user, chat, extra_context=payload.get("extra_context", "")
-            )
+            messages = await self.build_context_messages(user, chat, extra_context=payload.get("extra_context", ""))
             result = await self.ai.request(model, messages, user)
 
-            # Only two internal tool protocols are accepted.
+            # Handle only the two explicitly allowed tools.
             tool = parse_tool_call(result.text)
             if tool and tool.name == SAFE_TOOL_SCHOOL_DB:
                 await self.bot.send_message(payload["telegram_chat_id"], TEXT_DB)
-                await self.repo.record_event(
-                    "db_search_started",
-                    user_id,
-                    chat_id,
-                    {"tags": tool.arguments.get("tags", [])},
-                )
-                knowledge = await self.repo.find_knowledge(
-                    tool.arguments.get("query", ""),
-                    normalize_tags(tool.arguments.get("tags", [])),
-                )
+                await self.repo.record_event("db_search_started", user_id, chat_id, {"tags": tool.arguments.get("tags", [])})
+                knowledge = await self.repo.find_knowledge(tool.arguments.get("query", ""), normalize_tags(tool.arguments.get("tags", [])))
                 db_context = self.format_knowledge(knowledge)
-                await self.repo.record_event(
-                    "db_search_finished",
-                    user_id,
-                    chat_id,
-                    {"results": len(knowledge)},
-                )
-                messages2 = await self.build_context_messages(
-                    user,
-                    chat,
-                    extra_context=(
-                        payload.get("extra_context", "")
-                        + "\n\nSCHOOL_DB RESULT:\n"
-                        + db_context
-                    ).strip(),
-                )
-                messages2.append({"role": ROLE_USER, "content": payload["text"]})
+                await self.repo.record_event("db_search_finished", user_id, chat_id, {"results": len(knowledge)})
+                messages2 = await self.build_context_messages(user, chat, extra_context=(payload.get("extra_context", "") + "\n\nSCHOOL_DB RESULT:\n" + db_context).strip())
+                messages2.append({"role": "user", "content": payload["text"]})
                 result2 = await self.ai.request(model, messages2, user)
                 result = AIResult(
                     text=result2.text,
@@ -2371,17 +2086,10 @@ class App:
                     chat_id,
                     payload.get("message_id"),
                     question,
-                    {
-                        "extra_context": payload.get("extra_context", ""),
-                        "original_text": payload["text"],
-                    },
+                    {"extra_context": payload.get("extra_context", ""), "original_text": payload["text"]},
                 )
                 await self.bot.send_message(payload["telegram_chat_id"], f"❓ {question}")
-                usage_state = await self.repo.get_usage(
-                    user_id,
-                    model["model_key"],
-                    int(model["reset_period_seconds"] or DEFAULT_RESET_PERIOD),
-                )
+                usage_state = await self.repo.get_usage(user_id, model["model_key"], int(model["reset_period_seconds"] or DEFAULT_RESET_PERIOD))
                 await self.repo.add_usage(
                     user_id,
                     model["model_key"],
@@ -2392,76 +2100,26 @@ class App:
                     usage_state["window_reset"],
                     result.request_id,
                 )
-                await self.repo.record_event("waiting_for_user", user_id, chat_id, {})
                 return
 
-            usage_state = await self.repo.get_usage(
-                user_id,
-                model["model_key"],
-                int(model["reset_period_seconds"] or DEFAULT_RESET_PERIOD),
-            )
-            await self.repo.add_usage(
-                user_id,
-                model["model_key"],
-                chat_id,
-                result.input_tokens,
-                result.output_tokens,
-                usage_state["window_start"],
-                usage_state["window_reset"],
-                result.request_id,
-            )
-            await self.repo.save_message(
-                chat_id,
-                ROLE_ASSISTANT,
-                result.text,
-                model["model_key"],
-                result.input_tokens,
-                result.output_tokens,
-            )
+            # Store usage + assistant message.
+            usage_state = await self.repo.get_usage(user_id, model["model_key"], int(model["reset_period_seconds"] or DEFAULT_RESET_PERIOD))
+            await self.repo.add_usage(user_id, model["model_key"], chat_id, result.input_tokens, result.output_tokens, usage_state["window_start"], usage_state["window_reset"], result.request_id)
+            await self.repo.save_message(chat_id, ROLE_ASSISTANT, result.text, model["model_key"], result.input_tokens, result.output_tokens)
             await self.maybe_summarize(chat_id, user, model)
-            await self.repo.record_event(
-                "generation_finished",
-                user_id,
-                chat_id,
-                {"request_id": result.request_id},
-            )
-            await self.send_long(
-                payload["telegram_chat_id"],
-                result.text or "Не удалось получить текст ответа.",
-            )
-            await self.repo.record_event(
-                "completed",
-                user_id,
-                chat_id,
-                {"source": payload.get("source", "text")},
-            )
-        except asyncio.CancelledError:
-            raise
+            await self.repo.record_event("generation_finished", user_id, chat_id, {"request_id": result.request_id})
+            await self.send_long(payload["telegram_chat_id"], result.text or "Не удалось получить текст ответа.")
+            await self.repo.record_event("completed", user_id, chat_id, {})
         except Exception as exc:
             log.exception("AI job failed")
             if payload.get("telegram_chat_id"):
-                msg = (
-                    "❌ Ошибка API."
-                    if "HTTP" in str(exc) or isinstance(exc, aiohttp.ClientError)
-                    else "❌ Ошибка генерации.\nПопробуйте ещё раз."
-                )
+                msg = "❌ Ошибка API." if "HTTP" in str(exc) or isinstance(exc, aiohttp.ClientError) else "❌ Ошибка генерации.\nПопробуйте ещё раз."
                 try:
                     await self.bot.send_message(payload["telegram_chat_id"], msg)
                 except Exception:
                     pass
             if user_id:
-                try:
-                    await self.repo.record_event(
-                        "generation_error",
-                        user_id,
-                        chat_id,
-                        {"error": type(exc).__name__},
-                    )
-                except Exception:
-                    pass
-            # IMPORTANT: propagate the exception so PriorityQueueManager marks
-            # the persisted job as FAILED instead of incorrectly COMPLETED.
-            raise
+                await self.repo.record_event("generation_error", user_id, chat_id, {"error": type(exc).__name__})
 
     async def build_context_messages(self, user: sqlite3.Row, chat: sqlite3.Row, extra_context: str = "") -> list[dict[str, str]]:
         max_words = int(await self.repo.get_setting("max_context_words", str(MAX_CONTEXT_WORDS)) or MAX_CONTEXT_WORDS)
@@ -2550,96 +2208,70 @@ class App:
         chat = await self.db.fetchone("SELECT * FROM chats WHERE id=?", (chat_id,))
         if not user or not chat:
             raise RuntimeError("User or chat not found")
-
         tg_chat_id = payload["telegram_chat_id"]
         try:
             kind = payload.get("kind")
             if kind == "photo":
                 await self.bot.send_message(tg_chat_id, TEXT_OCR)
-            elif kind == "document":
+            elif kind in {"document"}:
                 await self.bot.send_message(tg_chat_id, TEXT_FILE)
             elif kind in {"audio", "video"}:
                 await self.bot.send_message(tg_chat_id, "👀 Обрабатываю медиа…")
-
-            # Stage 1: CPU/IO-heavy file work only. No AI call is made here.
             result = await self.files.process(file_row)
             context = result.text.strip()
             if result.kind in {"image", "table"}:
-                await self.bot.send_message(
-                    tg_chat_id,
-                    TEXT_TABLE if result.kind == "table" else TEXT_OCR,
-                )
-
+                await self.bot.send_message(tg_chat_id, TEXT_TABLE if result.kind == "table" else TEXT_OCR)
             caption = (payload.get("caption") or "").strip()
             if not caption:
                 caption = "Проанализируй этот файл и объясни содержимое по существу."
-
             details = (
                 f"[FILE: {file_row['original_name']}]\n"
                 f"Тип: {result.kind}\n"
                 f"Извлечённые данные:\n{truncate_text(context, 50_000)}"
             )
-            history_content = f"{caption}\n\n{details}"
-
             model = await self.selected_model(user)
             if not model:
-                raise RuntimeError("No enabled model")
+                raise RuntimeError("No model")
+            allowed, reset_at, _ = await self.can_use_model(user, model)
+            if not allowed:
+                reset_txt = human_duration(int((reset_at - utc_now()).total_seconds())) if reset_at else "позже"
+                await self.bot.send_message(tg_chat_id, f"⏳ Лимит этой модели временно исчерпан. Лимит обновится через {reset_txt}.")
+                return
 
-            # Replace the placeholder created during Telegram file intake.
-            # This prevents one upload from creating two user messages in history.
-            if file_row["message_id"]:
-                await self.repo.update_message(
-                    int(file_row["message_id"]),
-                    history_content,
-                    model["model_key"],
+            # Save a user-visible text representation of the file request for long-term history.
+            await self.repo.save_message(chat_id, ROLE_USER, f"{caption}\n\n{details}", model["model_key"])
+            await self.bot.send_message(tg_chat_id, TEXT_AI)
+            messages = await self.build_context_messages(user, chat, extra_context=details)
+            result_ai = await self.ai.request(model, messages + [{"role": "user", "content": caption}], user)
+            tool = parse_tool_call(result_ai.text)
+            if tool and tool.name == SAFE_TOOL_SCHOOL_DB:
+                await self.bot.send_message(tg_chat_id, TEXT_DB)
+                knowledge = await self.repo.find_knowledge(tool.arguments.get("query", ""), normalize_tags(tool.arguments.get("tags", [])))
+                db_context = self.format_knowledge(knowledge)
+                messages2 = await self.build_context_messages(user, chat, extra_context=details + "\n\nSCHOOL_DB RESULT:\n" + db_context)
+                result_ai2 = await self.ai.request(model, messages2 + [{"role": "user", "content": caption}], user)
+                result_ai = AIResult(
+                    text=result_ai2.text,
+                    input_tokens=result_ai.input_tokens + result_ai2.input_tokens,
+                    output_tokens=result_ai.output_tokens + result_ai2.output_tokens,
+                    request_id=result_ai2.request_id,
+                    raw=result_ai2.raw,
                 )
-            else:
-                message_id = await self.repo.save_message(
-                    chat_id, ROLE_USER, history_content, model["model_key"]
-                )
-                await self.repo.update_file(file_id, message_id=message_id)
+            elif tool and tool.name == SAFE_TOOL_ASK_USER:
+                await self.repo.upsert_pending_question(user["id"], chat_id, None, tool.arguments["question"], {"extra_context": details})
+                await self.bot.send_message(tg_chat_id, f"❓ {tool.arguments['question']}")
+                return
 
-            # Stage 2: AI is a separate persisted job with higher priority than
-            # new file-processing jobs, so all AI requests share one controlled path.
-            ai_payload = {
-                "telegram_chat_id": tg_chat_id,
-                "message_id": payload.get("message_id"),
-                "content_message_id": file_row["message_id"],
-                "text": caption,
-                "extra_context": details,
-                "source": "file",
-                "file_id": file_id,
-            }
-            ai_job_id = await self.repo.create_job(
-                "ai",
-                int(user["id"]),
-                chat_id,
-                ai_payload,
-                priority=20,
-            )
-            await self.queue.enqueue(ai_job_id, "ai", ai_payload, 20)
-            await self.repo.record_event(
-                "file_ai_enqueued",
-                int(user["id"]),
-                chat_id,
-                {"file_id": file_id, "ai_job_id": ai_job_id},
-            )
-        except asyncio.CancelledError:
-            raise
+            await self.repo.save_message(chat_id, ROLE_ASSISTANT, result_ai.text, model["model_key"], result_ai.input_tokens, result_ai.output_tokens)
+            usage_state = await self.repo.get_usage(user["id"], model["model_key"], int(model["reset_period_seconds"] or DEFAULT_RESET_PERIOD))
+            await self.repo.add_usage(user["id"], model["model_key"], chat_id, result_ai.input_tokens, result_ai.output_tokens, usage_state["window_start"], usage_state["window_reset"], result_ai.request_id)
+            await self.maybe_summarize(chat_id, user, model)
+            await self.send_long(tg_chat_id, result_ai.text)
+            await self.repo.record_event("completed", user["id"], chat_id, {"file_id": file_id})
         except Exception as exc:
             log.exception("File job failed")
-            try:
-                await self.bot.send_message(tg_chat_id, "❌ Не удалось обработать файл.")
-            except Exception:
-                pass
-            await self.repo.record_event(
-                "file_error",
-                int(user["id"]),
-                chat_id,
-                {"file_id": file_id, "error": type(exc).__name__},
-            )
-            # IMPORTANT: propagate so the persisted file job becomes FAILED.
-            raise
+            await self.bot.send_message(tg_chat_id, "❌ Не удалось обработать файл.")
+            await self.repo.record_event("file_error", user["id"], chat_id, {"file_id": file_id, "error": type(exc).__name__})
 
     # ------------------------------------------------------------------
     # Admin panel
@@ -2666,477 +2298,7 @@ class App:
         b.adjust(2, 2, 2, 2, 2, 2, 1)
         await self.bot.send_message(chat_id, "👑 <b>Админ-панель</b>", reply_markup=b.as_markup())
 
-    async def show_admin_models(self, chat_id: int):
-        rows = await self.repo.get_models(False)
-
-        default_key = await self.repo.get_setting("default_model_id", "")
-        summary_key = await self.repo.get_setting("summary_model_id", "")
-
-        b = InlineKeyboardBuilder()
-
-        if not rows:
-            text = (
-                "🤖 <b>Модели</b>\n\n"
-                "Моделей пока нет.\n"
-                "Добавьте первую модель через кнопку ниже."
-            )
-        else:
-            lines = ["🤖 <b>Модели</b>", ""]
-
-            for model in rows:
-                key = model["model_key"]
-                status = "🟢 Включена" if int(model["enabled"]) else "🔴 Выключена"
-
-                marks = []
-                if key == default_key:
-                    marks.append("⭐ по умолчанию")
-                if key == summary_key:
-                    marks.append("📝 для резюме")
-
-                suffix = f"\n{' | '.join(marks)}" if marks else ""
-
-                lines.append(
-                    f"<b>{model['name']}</b>\n"
-                    f"<code>{key}</code>\n"
-                    f"{status}\n"
-                    f"🧵 Одновременных запросов: {model['max_concurrency']}\n"
-                    f"🆓 Бесплатный лимит: {model['free_token_limit']}\n"
-                    f"💎 Платный лимит: {model['paid_token_limit']}\n"
-                    f"🔢 Приоритет: {model['priority']}"
-                    f"{suffix}\n"
-                )
-
-                b.button(
-                    text=f"✏️ {model['name']}",
-                    callback_data=f"admin:model_edit:{key}",
-                )
-
-                if int(model["enabled"]):
-                    b.button(
-                        text=f"🔴 Выключить {model['name']}",
-                        callback_data=f"admin:model_toggle:{key}",
-                    )
-                else:
-                    b.button(
-                        text=f"🟢 Включить {model['name']}",
-                        callback_data=f"admin:model_toggle:{key}",
-                    )
-
-                b.button(
-                    text=f"⭐ По умолчанию: {model['name']}",
-                    callback_data=f"admin:model_default:{key}",
-                )
-
-                b.button(
-                    text=f"📝 Для резюме: {model['name']}",
-                    callback_data=f"admin:model_summary:{key}",
-                )
-
-                b.button(
-                    text=f"🗑 Удалить {model['name']}",
-                    callback_data=f"admin:model_delete:{key}",
-                )
-
-        b.button(text="➕ Добавить модель", callback_data="admin:model_add")
-        b.button(text="⬅️ Админ-панель", callback_data="admin_home")
-        b.adjust(1)
-
-        await self.bot.send_message(
-            chat_id,
-            text,
-            reply_markup=b.as_markup(),
-        )
-
-    async def start_model_wizard(
-        self,
-        chat_id: int,
-        mode: str,
-        model_key: str = "",
-    ):
-        if mode not in {"add", "edit"}:
-            return
-
-        if mode == "edit":
-            model = await self.repo.get_model(model_key)
-            if not model:
-                await self.bot.send_message(chat_id, "❌ Модель не найдена.")
-                return
-
-            self.model_wizards[chat_id] = {
-                "mode": "edit",
-                "model_key": model_key,
-                "step": 1,
-                "values": {
-                    "name": model["name"] or "",
-                    "model_id": model["model_id"] or "",
-                    "base_url": model["base_url"] or "",
-                    "api_key": model["api_key"] or "",
-                    "free_token_limit": int(model["free_token_limit"] or 0),
-                    "paid_token_limit": int(model["paid_token_limit"] or 0),
-                    "reset_period_seconds": int(model["reset_period_seconds"] or 0),
-                    "max_concurrency": int(model["max_concurrency"] or 10),
-                    "priority": int(model["priority"] or 100),
-                },
-            }
-
-            await self.bot.send_message(
-                chat_id,
-                "✏️ <b>Изменение модели</b>\n\n"
-                "Можно оставить текущее значение, отправив <code>-</code>.\n\n"
-                "Шаг 1/9 — Название модели:",
-            )
-            return
-
-        self.model_wizards[chat_id] = {
-            "mode": "add",
-            "step": 1,
-            "values": {},
-        }
-
-        await self.bot.send_message(
-            chat_id,
-            "➕ <b>Добавление модели</b>\n\n"
-            "Шаг 1/10 — уникальный ключ модели.\n"
-            "Например: <code>qwen35</code>",
-        )
-
-    async def handle_model_wizard_message(self, message: Message):
-        chat_id = message.chat.id
-        wizard = self.model_wizards.get(chat_id)
-        if not wizard:
-            return
-
-        text = (message.text or "").strip()
-        if not text:
-            return
-
-        mode = wizard["mode"]
-        step = int(wizard["step"])
-        values = wizard["values"]
-
-        if text.lower() in {"/cancel", "отмена", "cancel"}:
-            self.model_wizards.pop(chat_id, None)
-            await message.answer("❌ Добавление/изменение модели отменено.")
-            await self.show_admin_models(chat_id)
-            return
-
-        def require_int(value: str, field: str, minimum: int = 0) -> int | None:
-            try:
-                number = int(value)
-            except ValueError:
-                return None
-            if number < minimum:
-                return None
-            return number
-
-        if mode == "add":
-            if step == 1:
-                if not re.fullmatch(r"[A-Za-z0-9_.-]{2,64}", text):
-                    await message.answer(
-                        "❌ Ключ должен содержать 2–64 символа: A-Z, a-z, 0-9, _, -, ."
-                    )
-                    return
-
-                if await self.repo.get_model(text):
-                    await message.answer("❌ Такой model_key уже существует.")
-                    return
-
-                values["model_key"] = text
-                wizard["step"] = 2
-                await message.answer("Шаг 2/10 — Название модели:")
-                return
-
-            if step == 2:
-                values["name"] = text
-                wizard["step"] = 3
-                await message.answer("Шаг 3/10 — Model ID у провайдера:")
-                return
-
-            if step == 3:
-                values["model_id"] = text
-                wizard["step"] = 4
-                await message.answer("Шаг 4/10 — Base URL API:")
-                return
-
-            if step == 4:
-                if not re.match(r"^https?://", text):
-                    await message.answer("❌ Base URL должен начинаться с http:// или https://")
-                    return
-
-                values["base_url"] = text.rstrip("/")
-                wizard["step"] = 5
-                await message.answer(
-                    "Шаг 5/10 — API Key:\n"
-                    "После отправки сообщение с ключом будет удалено."
-                )
-                return
-
-            if step == 5:
-                values["api_key"] = text
-
-                try:
-                    await message.delete()
-                except Exception:
-                    pass
-
-                wizard["step"] = 6
-                await self.bot.send_message(
-                    chat_id,
-                    "Шаг 6/10 — Бесплатный лимит токенов за период.\n"
-                    "Например: <code>500000</code>\n"
-                    "0 = без лимита.",
-                )
-                return
-
-            if step == 6:
-                number = require_int(text, "free_token_limit")
-                if number is None:
-                    await message.answer("❌ Нужен целый неотрицательный номер.")
-                    return
-                values["free_token_limit"] = number
-                wizard["step"] = 7
-                await message.answer(
-                    "Шаг 7/10 — Платный лимит токенов за период.\n"
-                    "0 = без лимита."
-                )
-                return
-
-            if step == 7:
-                number = require_int(text, "paid_token_limit")
-                if number is None:
-                    await message.answer("❌ Нужен целый неотрицательный номер.")
-                    return
-                values["paid_token_limit"] = number
-                wizard["step"] = 8
-                await message.answer(
-                    "Шаг 8/10 — Период сброса лимита в секундах.\n"
-                    "6 часов = <code>21600</code>."
-                )
-                return
-
-            if step == 8:
-                number = require_int(text, "reset_period_seconds", 1)
-                if number is None:
-                    await message.answer("❌ Нужно положительное целое число.")
-                    return
-                values["reset_period_seconds"] = number
-                wizard["step"] = 9
-                await message.answer(
-                    "Шаг 9/10 — Максимум одновременных запросов.\n"
-                    "Например: <code>10</code>."
-                )
-                return
-
-            if step == 9:
-                number = require_int(text, "max_concurrency", 1)
-                if number is None:
-                    await message.answer("❌ Нужно положительное целое число.")
-                    return
-                values["max_concurrency"] = number
-                wizard["step"] = 10
-                await message.answer(
-                    "Шаг 10/10 — Приоритет модели.\n"
-                    "Меньшее число = выше приоритет.\n"
-                    "Например: <code>100</code>."
-                )
-                return
-
-            if step == 10:
-                number = require_int(text, "priority", 0)
-                if number is None:
-                    await message.answer("❌ Нужен целый неотрицательный номер.")
-                    return
-                values["priority"] = number
-                await self.finish_model_wizard(chat_id)
-                return
-
-        if mode == "edit":
-            current = values
-
-            fields = [
-                ("name", "Название модели"),
-                ("model_id", "Model ID"),
-                ("base_url", "Base URL"),
-                ("api_key", "API Key"),
-                ("free_token_limit", "Бесплатный лимит"),
-                ("paid_token_limit", "Платный лимит"),
-                ("reset_period_seconds", "Период сброса"),
-                ("max_concurrency", "Максимум одновременных запросов"),
-                ("priority", "Приоритет"),
-            ]
-
-            field, title = fields[step - 1]
-
-            if text == "-":
-                wizard["step"] = step + 1
-            else:
-                if field in {"free_token_limit", "paid_token_limit", "reset_period_seconds", "max_concurrency", "priority"}:
-                    minimum = 1 if field in {"reset_period_seconds", "max_concurrency"} else 0
-                    number = require_int(text, field, minimum)
-                    if number is None:
-                        await message.answer("❌ Некорректное числовое значение.")
-                        return
-                    current[field] = number
-
-                elif field == "base_url":
-                    if not re.match(r"^https?://", text):
-                        await message.answer("❌ Base URL должен начинаться с http:// или https://")
-                        return
-                    current[field] = text.rstrip("/")
-
-                elif field == "api_key":
-                    current[field] = text
-                    try:
-                        await message.delete()
-                    except Exception:
-                        pass
-
-                else:
-                    current[field] = text
-
-                wizard["step"] = step + 1
-
-            next_step = int(wizard["step"])
-
-            if next_step <= 9:
-                _, next_title = fields[next_step - 1]
-                suffix = " Можно отправить <code>-</code>, чтобы оставить текущее." if next_step != 4 else " Можно отправить <code>-</code>, чтобы оставить текущий ключ."
-                await self.bot.send_message(
-                    chat_id,
-                    f"Шаг {next_step}/9 — {next_title}.{suffix}",
-                )
-                return
-
-            await self.finish_model_wizard(chat_id)
-            return
-
-    async def finish_model_wizard(self, chat_id: int):
-        wizard = self.model_wizards.get(chat_id)
-        if not wizard:
-            return
-
-        mode = wizard["mode"]
-        values = wizard["values"]
-
-        try:
-            if mode == "add":
-                now = iso_now()
-
-                await self.db.execute(
-                    """
-                    INSERT INTO models (
-                        model_key,
-                        name,
-                        model_id,
-                        base_url,
-                        api_key,
-                        api_format,
-                        enabled,
-                        free_token_limit,
-                        paid_token_limit,
-                        reset_period_seconds,
-                        max_concurrency,
-                        priority,
-                        temperature,
-                        max_output_tokens,
-                        extra_json,
-                        created_at,
-                        updated_at
-                    )
-                    VALUES (?, ?, ?, ?, ?, 'openai_chat', 1, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?)
-                    """,
-                    (
-                        values["model_key"],
-                        values["name"],
-                        values["model_id"],
-                        values["base_url"],
-                        values["api_key"],
-                        int(values["free_token_limit"]),
-                        int(values["paid_token_limit"]),
-                        int(values["reset_period_seconds"]),
-                        int(values["max_concurrency"]),
-                        int(values["priority"]),
-                        now,
-                        now,
-                    ),
-                )
-
-                default_key = await self.repo.get_setting("default_model_id", "")
-                if not default_key:
-                    await self.repo.set_setting(
-                        "default_model_id",
-                        str(values["model_key"]),
-                    )
-
-                await self.bot.send_message(
-                    chat_id,
-                    f"✅ Модель <b>{values['name']}</b> добавлена.",
-                )
-
-            else:
-                model_key = str(wizard["model_key"])
-
-                current = await self.repo.get_model(model_key)
-                if not current:
-                    raise RuntimeError("Модель больше не существует")
-
-                now = iso_now()
-
-                await self.db.execute(
-                    """
-                    UPDATE models
-                    SET
-                        name=?,
-                        model_id=?,
-                        base_url=?,
-                        api_key=?,
-                        free_token_limit=?,
-                        paid_token_limit=?,
-                        reset_period_seconds=?,
-                        max_concurrency=?,
-                        priority=?,
-                        updated_at=?
-                    WHERE model_key=?
-                    """,
-                    (
-                        values["name"],
-                        values["model_id"],
-                        values["base_url"],
-                        values["api_key"],
-                        int(values["free_token_limit"]),
-                        int(values["paid_token_limit"]),
-                        int(values["reset_period_seconds"]),
-                        int(values["max_concurrency"]),
-                        int(values["priority"]),
-                        now,
-                        model_key,
-                    ),
-                )
-
-                self.ai.semaphores.pop(model_key, None)
-
-                await self.bot.send_message(
-                    chat_id,
-                    f"✅ Модель <b>{values['name']}</b> обновлена.",
-                )
-
-        except Exception as exc:
-            log.exception("Model wizard failed")
-            await self.bot.send_message(
-                chat_id,
-                f"❌ Не удалось сохранить модель: {type(exc).__name__}",
-            )
-            return
-        finally:
-            self.model_wizards.pop(chat_id, None)
-
-        await self.show_admin_models(chat_id)
-
     async def handle_admin_callback(self, chat_id: int, section: str, user: sqlite3.Row):
-        if section == "models":
-            await self.show_admin_models(chat_id)
-            return
-
         if section == "users":
             count = (await self.db.fetchone("SELECT COUNT(*) c FROM users"))["c"]
             blocked = (await self.db.fetchone("SELECT COUNT(*) c FROM users WHERE is_blocked=1"))["c"]
