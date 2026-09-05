@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""Render Web Service entrypoint for the simplified Telegram AI bot."""
-
 from __future__ import annotations
 
 import asyncio
@@ -20,9 +18,7 @@ PORT = int(os.getenv("PORT", "10000"))
 
 
 def parse_admin_ids() -> set[int]:
-    """Parse ADMIN_TELEGRAM_IDS from Render environment."""
     raw = os.getenv("ADMIN_TELEGRAM_IDS", "")
-
     result: set[int] = set()
 
     for value in raw.replace(";", ",").replace("\n", ",").split(","):
@@ -37,14 +33,11 @@ def parse_admin_ids() -> set[int]:
     return result
 
 
-# Sync admin IDs with Render environment.
 bot_main.ADMIN_IDS.clear()
 bot_main.ADMIN_IDS.update(parse_admin_ids())
 
 
-async def prepare_app(app: bot_main.BotApp) -> None:
-    """Prepare the simplified application."""
-
+async def prepare_app(app: bot_main.App) -> None:
     if not bot_main.BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN не задан")
 
@@ -57,38 +50,40 @@ async def prepare_app(app: bot_main.BotApp) -> None:
     if not bot_main.AI_MODEL_ID:
         raise RuntimeError("AI_MODEL_ID не задан")
 
+    await app.ai.start()
+    await app.queue.start()
+
     bot_main.log.info(
-        "AI configuration loaded: model=%s, model_id=%s",
+        "AI model: %s (%s)",
         bot_main.AI_MODEL_NAME,
         bot_main.AI_MODEL_ID,
     )
 
-    bot_main.log.info(
-        "Admins configured: %s",
-        sorted(bot_main.ADMIN_IDS),
-    )
 
-
-async def cleanup_app(app: bot_main.BotApp) -> None:
-    """Cleanly close bot resources."""
-
+async def cleanup_app(app: bot_main.App) -> None:
     try:
-        await app.ai.close()
+        await app.queue.stop()
     finally:
-        await app.bot.session.close()
+        try:
+            await app.ai.close()
+        finally:
+            await app.bot.session.close()
 
 
-async def create_http_app(app: bot_main.BotApp) -> web.Application:
-    """Create Render HTTP application and Telegram webhook."""
+async def create_http_app(
+    app: bot_main.App,
+) -> web.Application:
 
     http_app = web.Application(
         client_max_size=50 * 1024 * 1024
     )
 
-    secret = os.getenv("WEBHOOK_SECRET", "").strip()
+    secret = os.getenv(
+        "WEBHOOK_SECRET",
+        "",
+    ).strip()
 
     if not secret:
-        # Stable secret derived from BOT_TOKEN.
         secret = hashlib.sha256(
             bot_main.BOT_TOKEN.encode("utf-8")
         ).hexdigest()[:48]
@@ -106,35 +101,37 @@ async def create_http_app(app: bot_main.BotApp) -> web.Application:
     if not webhook_url:
         if not external_url:
             raise RuntimeError(
-                "RENDER_EXTERNAL_URL не найден. "
-                "Render обычно предоставляет его автоматически. "
-                "Либо задайте WEBHOOK_URL вручную."
+                "RENDER_EXTERNAL_URL не найден"
             )
 
         webhook_url = (
             f"{external_url}/telegram/webhook/{secret}"
         )
 
-    async def health(request: web.Request) -> web.Response:
-        return web.json_response(
-            {
-                "ok": True,
-                "service": "aitg",
-                "model": bot_main.AI_MODEL_NAME,
-                "model_id": bot_main.AI_MODEL_ID,
-                "admins_configured": len(bot_main.ADMIN_IDS),
-            }
-        )
+    async def health(
+        request: web.Request,
+    ) -> web.Response:
 
-    async def webhook(request: web.Request) -> web.Response:
-        # Check URL secret.
+        return web.json_response({
+            "ok": True,
+            "service": "aitg",
+            "model": bot_main.AI_MODEL_NAME,
+            "model_id": bot_main.AI_MODEL_ID,
+            "admins_configured": len(
+                bot_main.ADMIN_IDS
+            ),
+        })
+
+    async def webhook(
+        request: web.Request,
+    ) -> web.Response:
+
         if request.match_info.get("secret") != secret:
             return web.Response(
                 status=404,
                 text="Not found",
             )
 
-        # Check Telegram secret header.
         header_secret = request.headers.get(
             "X-Telegram-Bot-Api-Secret-Token",
             "",
@@ -185,7 +182,6 @@ async def create_http_app(app: bot_main.BotApp) -> web.Application:
         webhook,
     )
 
-    # Configure Telegram webhook.
     await app.bot.set_webhook(
         webhook_url,
         secret_token=secret,
@@ -194,28 +190,26 @@ async def create_http_app(app: bot_main.BotApp) -> web.Application:
     )
 
     bot_main.log.info(
-        "Telegram webhook configured: %s",
-        webhook_url,
-    )
-
-    bot_main.log.info(
-        "Render HTTP server will listen on %s:%s",
-        HOST,
-        PORT,
+        "Webhook configured"
     )
 
     return http_app
 
 
 async def main_async() -> None:
-    app = bot_main.BotApp()
+
+    app = bot_main.App()
 
     try:
         await prepare_app(app)
 
-        http_app = await create_http_app(app)
+        http_app = await create_http_app(
+            app
+        )
 
-        runner = web.AppRunner(http_app)
+        runner = web.AppRunner(
+            http_app
+        )
 
         await runner.setup()
 
@@ -246,4 +240,6 @@ async def main_async() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main_async())
+    asyncio.run(
+        main_async()
+    )
