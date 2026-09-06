@@ -3305,20 +3305,6 @@ class BotApp:
                 f"@{SUPPORT_USERNAME}"
             )
 
-        elif ADMIN_IDS:
-            support_text = (
-                "\n\n"
-                "💬 По вопросам покупки "
-                "обратитесь к администратору."
-            )
-
-        else:
-            support_text = (
-                "\n\n"
-                "💬 Поддержка временно "
-                "не настроена."
-            )
-
         text = (
             "<b>С подпиской можно задавать больше вопросов</b>\n\n"
             f"{subscription_status}\n"
@@ -3338,19 +3324,6 @@ class BotApp:
         keyboard_rows: list[
             list[InlineKeyboardButton]
         ] = []
-
-        if SUPPORT_USERNAME:
-            keyboard_rows.append(
-                [
-                    InlineKeyboardButton(
-                        text="Купить подписку:",
-                        url=(
-                            f"https://t.me/"
-                            f"{SUPPORT_USERNAME}"
-                        ),
-                    )
-                ]
-            )
 
         await message.answer(
             text,
