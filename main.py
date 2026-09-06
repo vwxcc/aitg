@@ -3320,16 +3320,16 @@ class BotApp:
             )
 
         text = (
-            "👥 <b>Подписка</b>\n\n"
-            f"{subscription_status}\n\n"
-            "📊 Лимит запросов: "
-            f"<b>{current_limit}</b> "
+            "<b>С подпиской можно задавать больше вопросов</b>\n\n"
+            f"{subscription_status}\n"
+            "📊 Лимит токенов: "
+            f"<b>{current_limit / 1000} K </b> "
             f"за {LIMIT_PERIOD_HOURS} ч.\n\n"
             "🎁 <b>Пригласите друга</b>\n"
-            "За каждого нового пользователя "
+            "За друга "
             "вы получите "
             f"<b>{REFERRAL_BONUS_DAYS} дн.</b> "
-            "подписки.\n\n"
+            "подписки.\n"
             "🔗 Ваша реферальная ссылка:\n"
             f"<code>{html.escape(referral_link)}</code>\n\n"
             "👤 Приглашено: "
@@ -3345,7 +3345,7 @@ class BotApp:
             keyboard_rows.append(
                 [
                     InlineKeyboardButton(
-                        text="💬 Поддержка",
+                        text="Купить подписку:",
                         url=(
                             f"https://t.me/"
                             f"{SUPPORT_USERNAME}"
