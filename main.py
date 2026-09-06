@@ -3318,7 +3318,6 @@ class BotApp:
             f"<code>{html.escape(referral_link)}</code>\n\n"
             "👤 Приглашено: "
             f"<b>{referral_count}</b>"
-            f"{support_text}"
         )
 
         keyboard_rows: list[
