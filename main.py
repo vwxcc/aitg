@@ -3313,10 +3313,9 @@ class BotApp:
             f"Лимит обновляется каждые {LIMIT_PERIOD_HOURS} ч. \n\n"
             "🎁 <b>Пригласите друга и получите </b>"
             f"<b>{REFERRAL_BONUS_DAYS} дн.</b> "
-            "подписки.\n"
-            "🔗 Ваша реферальная ссылка:\n"
+            "подписки: \n"
             f"<code>{html.escape(referral_link)}</code>\n\n"
-            "👤 Приглашено: "
+            " Приглашено: "
             f"<b>{referral_count}</b>"
         )
 
